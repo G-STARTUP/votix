@@ -1,0 +1,188 @@
+Strowallet – Création de Carte Virtuelle (Guide React Basé sur le Code PHP)
+==========================================================================
+
+Objectif
+--------
+Fournir, à partir de l'analyse du code PHP (`create_strowallet_virtual_card` dans `app/Http/Helpers/strowallet-card.php`), le payload correct et les réponses attendues pour implémenter la création de carte virtuelle Strowallet côté React (via un backend ou edge function). Ce guide corrige la divergence constatée: le code PHP actuel n'envoie pas `currency` mais l'API exige ce champ (sinon erreur 500).
+
+Référence Code PHP (extraits)
+-----------------------------
+Fonction actuelle côté backend Laravel:
+```
+function create_strowallet_virtual_card($user,$cardAmount,$customer,$public_key,$base_url,$formData){
+    $mode = ...; // sandbox ou production
+    $data = [
+        'name_on_card'  => $formData['name_on_card'] ?? $user->username,
+        'card_type'     => 'visa',
+        'public_key'    => $public_key,
+        'amount'        => $cardAmount,
+        'customerEmail' => $customer->customerEmail,
+        // MANQUE 'currency'
+    ];
+    if ($mode === 'sandbox') $data['mode'] = 'sandbox';
+    $data['developer_code'] = 'appdevsx';
+    // POST JSON vers base_url."create-card/"
+}
+```
+
+Différence critique: Le champ `currency` doit être ajouté dans la version React/Node.
+
+Pré‑requis
+----------
+1. Disposer de la clé publique Strowallet: exemple réel sans préfixe (`1JA6RG3ED5XPKPJQ7B2W54QHOJJGKV`).
+2. Avoir créé un client (KYC) et récupérer `customerEmail` valide.
+3. Avoir un solde suffisant dans le compte principal Strowallet (montant + frais). Erreur possible: `{"success":false,"error":"Solde insuffisant. Disponible: 0 USD. Requis (avec frais): 5.54 USD"}`.
+4. Envoyer la requête via un backend sécurisé (ne pas exposer la clé directement dans le front). React appelle votre route interne (`/api/virtual-card/create`).
+5. Gérer le mode sandbox via un flag d'environnement (`STROWALLET_MODE=sandbox|live`).
+
+Payload Correct (JSON Body)
+--------------------------
+```json
+{
+  "public_key": "1JA6RG3ED5XPKPJQ7B2W54QHOJJGKV",
+  "name_on_card": "John Doe",
+  "card_type": "visa",
+  "amount": 25.00,
+  "currency": "USD",
+  "customerEmail": "john.doe@example.com",
+  "developer_code": "appdevsx",
+  "mode": "sandbox"
+}
+```
+Notes:
+- `currency`: Obligatoire (ex: USD, NGN, GHS). Manquant => 500.
+- `mode`: N'envoyer que si sandbox; omettre en production.
+- `developer_code`: D'après code PHP, valeur statique `appdevsx` (confirmer avec Strowallet si personnalisable).
+
+Description des Champs
+----------------------
+| Champ | Type | Obligatoire | Source | Description |
+|-------|------|-------------|--------|-------------|
+| public_key | string | Oui | ENV backend | Identifiant public API Strowallet (format upper-case alphanumérique). |
+| name_on_card | string | Oui | Saisie user ou username | Nom affiché sur la carte virtuelle. |
+| card_type | string | Oui | Hardcodé 'visa' | Type de carte. Vérifier si 'mastercard' supporté. |
+| amount | number | Oui | Input utilisateur validé | Montant initial chargé. |
+| currency | string | Oui | Sélecteur utilisateur | Devise de la carte (et du solde initial). |
+| customerEmail | string | Oui | Résultat création client | Email du client enregistré chez Strowallet. |
+| developer_code | string | Non (souvent) | Statique | Code développeur fourni (trace interne). |
+| mode | string | Non (prod) / Oui (sandbox) | ENV | Forcer contexte sandbox. |
+
+Exemple Implémentation Backend (Node/Express)
+--------------------------------------------
+```js
+// route: POST /api/strowallet/create-card
+import axios from 'axios';
+
+export async function createStrowalletCard(req, res) {
+  try {
+    const { name_on_card, amount, currency, customerEmail } = req.body;
+    if(!name_on_card || !amount || !currency || !customerEmail) {
+      return res.status(400).json({ success: false, message: 'Missing required fields' });
+    }
+
+    const payload = {
+      public_key: process.env.STROWALLET_PUBLIC_KEY,
+      name_on_card,
+      card_type: 'visa',
+      amount: Number(amount),
+      currency,
+      customerEmail,
+      developer_code: 'appdevsx',
+    };
+    if(process.env.STROWALLET_MODE === 'sandbox') payload.mode = 'sandbox';
+
+    const url = `${process.env.STROWALLET_BASE_URL}create-card/`;
+    const apiResp = await axios.post(url, payload, { headers: { 'accept': 'application/json','content-type':'application/json' } });
+
+    return res.status(200).json(apiResp.data);
+  } catch (e) {
+    if(e.response) return res.status(e.response.status).json(e.response.data);
+    return res.status(500).json({ success:false, message:'Internal error', detail: e.message });
+  }
+}
+```
+
+Exemple Appel côté React
+------------------------
+```js
+async function createCard(values) {
+  const resp = await fetch('/api/strowallet/create-card', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name_on_card: values.name,
+      amount: values.amount,
+      currency: values.currency,
+      customerEmail: values.customerEmail,
+    }),
+  });
+  const data = await resp.json();
+  if(!data.success) throw new Error(data.message || 'Card creation failed');
+  return data.response;
+}
+```
+
+Réponse Succès (Exemple Générique)
+----------------------------------
+Le code PHP réexpédie `result['response']` si `success: true`. Structure observée dans autres docs:
+```json
+{
+  "success": true,
+  "response": {
+    "card_id": "card_ab12cd34ef56",
+    "card_status": "active",
+    "card_type": "visa",
+    "name_on_card": "John Doe",
+    "last4": "1234",
+    "balance": 25.00,
+    "currency": "USD",
+    "expiry": "12/27"
+  },
+  "message": "Card created"
+}
+```
+
+Réponses Erreur Possibles
+-------------------------
+1. Solde insuffisant (compte principal):
+```json
+{
+  "success": false,
+  "error": "Solde insuffisant. Disponible: 0 USD. Requis (avec frais): 5.54 USD",
+  "error_code": "CARD_CREATION_ERROR"
+}
+```
+2. Currency manquante (500 générique): Le serveur peut renvoyer une erreur interne sans structure détaillée.
+3. Email client introuvable:
+```json
+{ "success": false, "message": "Customer with this email not found." }
+```
+4. Autres (message fusionné):
+```json
+{ "success": false, "message": "Contact With Strowallet Account Administration, <texte>" }
+```
+
+Validation Recommandée Avant Envoi
+----------------------------------
+- Vérifier `amount` numérique > 0.
+- Vérifier `currency` ∈ liste supportée (ex: ["USD"]).
+- Vérifier que le wallet interne utilisateur a le solde nécessaire + frais (cf. calcul côté PHP avec `TransactionSetting`).
+- Empêcher double soumission (bouton disabled lors de la requête).
+
+Différences / Ajustements à Apporter dans PHP
+--------------------------------------------
+- Ajouter `currency` dans `$data` de `create_strowallet_virtual_card` pour aligner avec la version React.
+- Optionnel: normaliser les erreurs en renvoyant toujours `{ success:false, message:"..." }` sans `error` séparé.
+
+Checklist Intégration React
+---------------------------
+- [ ] Variable ENV `STROWALLET_PUBLIC_KEY` chargée côté serveur.
+- [ ] Variable ENV `STROWALLET_BASE_URL` (`https://strowallet.com/api/`).
+- [ ] Mode sandbox contrôlé par `STROWALLET_MODE`.
+- [ ] Endpoint interne `/api/strowallet/create-card` protégé (auth middleware).
+- [ ] Gestion spinner + disable bouton.
+- [ ] Logging erreurs (Sentry ou console + toast UI).
+
+Résumé
+------
+Le code PHP montre un payload partiel. La version correcte pour React doit inclure `currency`. Ce guide fournit structure, exemples et bonnes pratiques pour une intégration fiable.

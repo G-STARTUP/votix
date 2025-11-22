@@ -1,0 +1,477 @@
+Strowallet Endpoints Production – Payloads & Réponses Attendues
+===============================================================
+Base URL Production
+-------------------
+https://strowallet.com/api/
+Toutes les requêtes utilisent JSON (Content-Type: application/json) sauf endpoints GET avec query string.
+
+Authentification & Paramètres Communs
+------------------------------------
+- public_key: clé publique fournie par Strowallet (obligatoire sur la plupart des endpoints).
+- secret_key: utilisée côté serveur uniquement (jamais envoyée au client). Si un endpoint exige signature côté serveur, NE PAS exposer.
+- mode: NON requis en production (utilisé uniquement pour sandbox: mode=sandbox). Omettre pour environnement live.
+- Headers recommandés: accept: application/json ; content-type: application/json.
+
+Convention de Réponse Générale
+------------------------------
+Succès:
+```json
+{
+  "success": true,
+  "response": { /* données spécifiques à l'endpoint */ },
+  "message": "Action réussie"
+}
+```
+Erreur (validation ou logique):
+```json
+{
+  "success": false,
+  "message": "Détail de l'erreur",
+  "error_code": "CODE_INTERNE_OPTIONNEL"
+}
+```
+Codes HTTP typiques:
+- 200: succès
+- 400: erreur de validation / payload invalide
+- 401: clé publique invalide / non autorisé
+- 404: ressource introuvable (card, customer)
+- 429: dépassement de quota/rate limit
+- 500/502: erreur interne fournisseur
+
+Sommaire des Endpoints
+----------------------
+1. POST create-user/
+2. GET getcardholder/
+3. PUT updateCardCustomer/
+4. POST create-card/
+5. POST fetch-card-detail/
+6. GET wallet/balance/{currency}/
+7. (OPTIONNEL) POST fund-card/ (si disponible)
+8. (OPTIONNEL) POST block-card/ & POST unblock-card/ (si supportés côté Strowallet)
+9. (Webhook) POST /webhooks/strowallet (endpoint côté VOTRE serveur, non Strowallet)
+
+1. Création Utilisateur (Customer) – POST create-user/
+----------------------------------------------------
+URL: https://strowallet.com/api/create-user/
+Méthode: POST
+Payload attendu (production):
+```json
+{
+  "public_key": "pk_live_xxx",
+  "houseNumber": "12",
+  "firstName": "John",
+  "lastName": "Doe",
+  "idNumber": "ID123456",
+  "customerEmail": "john.doe@example.com",
+  "phoneNumber": "+233200000000",
+  "dateOfBirth": "1990-05-10",
+  "idImage": "https://cdn.example.com/kyc/id.jpg",   // URL ou base64 selon support
+  "userPhoto": "https://cdn.example.com/kyc/photo.jpg",
+  "line1": "12 Accra Street",
+  "state": "Greater Accra",
+  "zipCode": "10010",
+  "city": "Accra",
+  "country": "Ghana",
+  "idType": "PASSPORT"   // ou NATIONAL_ID / DRIVER_LICENSE
+}
+```
+Réponse succès (exemple):
+```json
+{
+  "success": true,
+  "response": {
+    "customerId": "cust_abc12345",
+    "customerEmail": "john.doe@example.com",
+    "status": "active",
+    "createdAt": "2025-11-21T10:15:43Z"
+  },
+  "message": "Customer created"
+}
+```
+Erreurs possibles:
+- idNumber déjà utilisé -> 400
+- email invalide -> 400
+- public_key inconnue -> 401
+
+2. Récupération Détails Customer – GET getcardholder/
+----------------------------------------------------
+URL: https://strowallet.com/api/getcardholder/
+Méthode: GET
+Query params:
+- public_key=pk_live_xxx
+- customerId=cust_abc12345
+- customerEmail=john.doe@example.com
+Exemple requête:
+```
+GET /api/getcardholder/?public_key=pk_live_xxx&customerId=cust_abc12345&customerEmail=john.doe@example.com
+```
+Réponse succès (exemple):
+```json
+{
+  "success": true,
+  "response": {
+    "customer": {
+      "customerId": "cust_abc12345",
+      "customerEmail": "john.doe@example.com",
+      "firstName": "John",
+      "lastName": "Doe",
+      "status": "active",
+      "kycLevel": "verified"
+    }
+  }
+}
+```
+
+3. Mise à Jour Customer – PUT updateCardCustomer/
+-------------------------------------------------
+URL: https://strowallet.com/api/updateCardCustomer/
+Méthode: PUT
+Query params (selon implémentation constatée):
+- public_key=pk_live_xxx
+- customerId=cust_abc12345
+- firstName=John
+- lastName=Doe
+- idImage=https://...
+- userPhoto=https://...
+Exemple:
+```
+PUT /api/updateCardCustomer/?public_key=pk_live_xxx&customerId=cust_abc12345&firstName=John&lastName=Doe&idImage=https://...&userPhoto=https://...
+```
+Réponse succès:
+```json
+{
+  "success": true,
+  "response": {
+    "customerId": "cust_abc12345",
+    "firstName": "John",
+    "lastName": "Doe",
+    "updatedAt": "2025-11-21T10:25:00Z"
+  }
+}
+```
+Erreurs:
+- customerId inconnu -> 404
+- format image invalide -> 400
+
+4. Création Carte – POST create-card/
+-------------------------------------
+URL: https://strowallet.com/api/create-card/
+Méthode: POST
+Payload:
+```json
+{
+  "public_key": "pk_live_xxx",
+  "name_on_card": "John Doe",
+  "card_type": "visa",          // ou mastercard
+  "amount": 25.00,               // montant initial / limite initiale selon API
+  "customerEmail": "john.doe@example.com",
+  "developer_code": "appdevsx"  // code développeur si requis
+}
+```
+Réponse succès:
+```json
+{
+  "success": true,
+  "response": {
+    "card_id": "card_987654321",
+    "card_status": "active",
+    "card_type": "visa",
+    "name_on_card": "John Doe",
+    "last4": "1234",
+    "balance": 25.00,
+    "currency": "USD",
+    "expiry": "12/27"
+  },
+  "message": "Card created"
+}
+```
+Erreurs:
+- customerEmail non associé -> 404
+- montant hors limite -> 400
+
+5. Détails Carte – POST fetch-card-detail/
+-----------------------------------------
+URL: https://strowallet.com/api/fetch-card-detail/
+Méthode: POST
+Payload:
+```json
+{
+  "public_key": "pk_live_xxx",
+  "card_id": "card_987654321"
+}
+```
+Réponse succès:
+```json
+{
+  "success": true,
+  "response": {
+    "card_detail": {
+      "card_id": "card_987654321",
+      "card_status": "active",
+      "card_type": "visa",
+      "name_on_card": "John Doe",
+      "last4": "1234",
+      "balance": 24.10,
+      "currency": "USD",
+      "expiry": "12/27",
+      "updatedAt": "2025-11-21T11:05:00Z"
+    }
+  }
+}
+```
+Erreurs:
+- card_id inconnu -> 404
+
+6. Solde Wallet – GET wallet/balance/{currency}/
+-----------------------------------------------
+URL: https://strowallet.com/api/wallet/balance/USD/
+Méthode: GET
+Query param: ?public_key=pk_live_xxx
+Réponse succès:
+```json
+{
+  "success": true,
+  "response": {
+    "currency": "USD",
+    "balance": 1025.55,
+    "available": 1000.00,
+    "pending": 25.55
+  }
+}
+```
+Erreurs:
+- currency non supportée -> 400
+
+7. (Optionnel) Recharger Carte – POST fund-card/
+-----------------------------------------------
+SI l'API propose un endpoint de funding direct.
+URL supposée: https://strowallet.com/api/fund-card/
+Payload hypothétique:
+```json
+{
+  "public_key": "pk_live_xxx",
+  "card_id": "card_987654321",
+  "amount": 10.00,
+  "currency": "USD"
+}
+```
+Réponse succès:
+```json
+{
+  "success": true,
+  "response": {
+    "card_id": "card_987654321",
+    "balance_before": 24.10,
+    "balance_after": 34.10,
+    "transaction_id": "txn_funding_abc01"
+  }
+}
+```
+Erreurs:
+- dépasse limite funding -> 400
+- card bloquée -> 409 (conflit) ou 400
+
+8. (Optionnel) Blocage / Déblocage Carte – POST block-card/ & unblock-card/
+--------------------------------------------------------------------------
+URL blocage: https://strowallet.com/api/block-card/
+Payload:
+```json
+{
+  "public_key": "pk_live_xxx",
+  "card_id": "card_987654321",
+  "reason": "suspected_fraud"
+}
+```
+Réponse succès:
+```json
+{
+  "success": true,
+  "response": {
+    "card_id": "card_987654321",
+    "card_status": "blocked",
+    "blocked_at": "2025-11-21T12:00:00Z"
+  }
+}
+```
+Déblocage: https://strowallet.com/api/unblock-card/
+Payload:
+```json
+{
+  "public_key": "pk_live_xxx",
+  "card_id": "card_987654321"
+}
+```
+Réponse succès:
+```json
+{
+  "success": true,
+  "response": {
+    "card_id": "card_987654321",
+    "card_status": "active",
+    "unblocked_at": "2025-11-21T12:15:00Z"
+  }
+}
+```
+Erreurs blocage:
+- carte déjà bloquée -> 409
+Erreurs déblocage:
+- carte non bloquée -> 400
+
+9. Webhook (Serveur Interne) – POST /webhooks/strowallet
+--------------------------------------------------------
+IMPORTANT: Ce n'est PAS un endpoint Strowallet public, mais celui que vous exposez pour recevoir leurs notifications.
+Headers attendus (proposition de sécurisation interne):
+- X-Strowallet-Signature: HMAC_SHA256(hex) du corps brut.
+- X-Strowallet-Timestamp: epoch ms.
+Exemple payload reçu:
+```json
+{
+  "event": "transaction.posted",
+  "id": "evt_tx_123",
+  "cardId": "card_987654321",
+  "amount": -5.90,
+  "currency": "USD",
+  "balance": 18.20,
+  "transaction_id": "txn_abc123",
+  "createdAt": "2025-11-21T12:30:10Z"
+}
+```
+Réponse à retourner:
+```json
+{ "success": true }
+```
+Si signature invalide:
+```json
+{ "success": false, "message": "Invalid signature" }
+```
+
+Différences Sandbox vs Production
+---------------------------------
+- Sandbox inclut généralement champ `mode":"sandbox"` dans payload (à ajouter manuellement). Production: omettre.
+- Montants et limites plus faibles en sandbox.
+- Latence potentiellement différente (monitoring séparé).
+- Données sandbox non réelles (PAN masqué systématiquement) alors qu'en production, vous devez appliquer vos propres politiques de masquage.
+
+Modèle d'Erreur Consolidé (Recommandé côté client)
+--------------------------------------------------
+Toujours normaliser erreurs, même si fournisseur varie:
+```json
+{
+  "success": false,
+  "message": "Message lisible",
+  "error_code": "UPSTREAM_VALIDATION",
+  "upstream": {
+    "status": 400,
+    "raw_message": "Invalid card_id"
+  }
+}
+```
+
+Exemples cURL Production
+------------------------
+Création customer:
+```bash
+curl -X POST https://strowallet.com/api/create-user/ \
+  -H 'Content-Type: application/json' -H 'accept: application/json' \
+  -d '{"public_key":"pk_live_xxx","houseNumber":"12","firstName":"John","lastName":"Doe","idNumber":"ID123","customerEmail":"john.doe@example.com","phoneNumber":"+233200000000","dateOfBirth":"1990-05-10","line1":"12 Accra Street","state":"Greater Accra","zipCode":"10010","city":"Accra","country":"Ghana","idType":"PASSPORT"}'
+```
+Détails carte:
+```bash
+curl -X POST https://strowallet.com/api/fetch-card-detail/ \
+  -H 'Content-Type: application/json' -H 'accept: application/json' \
+  -d '{"public_key":"pk_live_xxx","card_id":"card_987654321"}'
+```
+Solde wallet:
+```bash
+curl -X GET 'https://strowallet.com/api/wallet/balance/USD/?public_key=pk_live_xxx' -H 'accept: application/json'
+```
+
+Schémas JSON (Pseudo-Spec)
+--------------------------
+Customer (simplifié):
+```json
+{
+  "customerId": "string",
+  "customerEmail": "string",
+  "firstName": "string",
+  "lastName": "string",
+  "status": "active|blocked|inactive|pending",
+  "kycLevel": "unverified|verified|restricted"
+}
+```
+Card:
+```json
+{
+  "card_id": "string",
+  "card_status": "active|blocked|terminated|inactive",
+  "card_type": "visa|mastercard|other",
+  "name_on_card": "string",
+  "last4": "\d{4}",
+  "balance": 0,
+  "currency": "USD|EUR|...",
+  "expiry": "MM/YY"
+}
+```
+Transaction webhook:
+```json
+{
+  "event": "transaction.posted",
+  "id": "string",           // identifiant événement
+  "cardId": "string",
+  "transaction_id": "string",
+  "amount": -5.90,
+  "currency": "USD",
+  "balance": 18.20,
+  "createdAt": "ISO8601"
+}
+```
+Funding webhook (hypothétique):
+```json
+{
+  "event": "card.funded",
+  "id": "string",
+  "cardId": "string",
+  "amount": 10.00,
+  "currency": "USD",
+  "balance": 34.10,
+  "transaction_id": "txn_funding_abc01",
+  "createdAt": "ISO8601"
+}
+```
+
+Validation & Bonnes Pratiques
+-----------------------------
+- Toujours valider `public_key` présent avant requête fournisseur.
+- Ne pas exposer secret_key dans le front (utiliser proxy backend).
+- Masquer les numéros de carte côté UI (**** **** **** 1234).
+- Vérifier limites min/max sur `amount` avant funding.
+- Persister uniquement champs nécessaires pour réduire risques (pas de PAN complet).
+- Sur erreurs répétées (>=3) arrêter retries et alerter (circuit breaker).
+
+Journalisation Conseillée
+-------------------------
+Pour chaque requête externe:
+```json
+{
+  "layer": "strowallet_api",
+  "endpoint": "create-card",
+  "duration_ms": 420,
+  "status": 200,
+  "success": true,
+  "card_id": "card_987654321",
+  "correlation_id": "uuid-req-123"
+}
+```
+
+Limites & Hypothèses
+--------------------
+Certaines structures sont déduites du code existant et peuvent varier selon version API. Vérifier la documentation officielle Strowallet si disponible pour champs additionnels (ex: country codes, card_type supplémentaires, codes d'erreur normalisés).
+
+Prochaines Étapes Recommandées
+------------------------------
+1. Vérifier chaque endpoint en production avec un jeu de test réel et capturer réponses.
+2. Mettre à jour ce fichier avec champs supplémentaires détectés.
+3. Ajouter tests d’intégration qui valident schémas JSON.
+4. Implémenter monitoring latence + taux d'erreur.
+
+Fin du fichier.

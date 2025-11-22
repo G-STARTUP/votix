@@ -1,0 +1,260 @@
+Intégration Strowallet – Frontend React + Backend PHP (Laravel + Bootstrap)
+=======================================================================
+
+Objectif
+--------
+Fournir une référence unifiée pour intégrer Strowallet dans une stack existante Laravel (PHP) avec un frontend React (stylé Bootstrap ou équivalent). Basé sur le code PHP existant et les exigences corrigées (champ `currency` obligatoire) tout en conservant la sécurité (clé publique côté serveur uniquement).
+
+Architecture Globale
+--------------------
+1. Laravel sert d'API + pages Blade (fallback) + pipeline Vite pour bundler React.
+2. React SPA montée sur un container `<div id="app"></div>` rendu par Blade (ex: `resources/views/app.blade.php`).
+3. Laravel Controllers / Helpers encapsulent les appels Strowallet (fonctions: `stro_wallet_create_user`, `create_strowallet_virtual_card`, `card_details`, `strowalletBalance`).
+4. React consomme des endpoints internes (`/api/strowallet/...`) renvoyant JSON normalisé.
+5. Bootstrap (ou un thème) pour styliser formulaires, listes cartes, messages d’erreurs.
+
+Flux Fonctionnel
+----------------
+1. Enregistrement utilisateur → Création/association d'un profil client Strowallet (KYC minimal).
+2. Vérification solde wallet avant création carte virtuelle.
+3. Soumission formulaire création carte (name_on_card, amount, currency, customerEmail).
+4. Réception réponse → Stockage métadonnées carte (sans données sensibles).
+5. Affichage cartes + détail + balance + statut.
+6. Webhook (optionnel) pour mise à jour du `card_status` ou transactions.
+
+Endpoints Laravel (Proposés)
+----------------------------
+| Méthode | Route                               | Action                                    |
+|---------|-------------------------------------|-------------------------------------------|
+| POST    | /api/strowallet/customer            | createCustomer()                          |
+| GET     | /api/strowallet/balance/{currency}  | balance()                                 |
+| POST    | /api/strowallet/card                | createCard()                              |
+| POST    | /api/strowallet/card/detail         | cardDetail()                              |
+| POST    | /api/strowallet/webhook             | webhookReceiver()                         |
+
+Exemple Controller (extraits simplifiés)
+---------------------------------------
+```php
+class StrowalletController extends Controller {
+    public function createCustomer(Request $r){
+        $data = $r->validate([
+            'customerEmail'=>'required|email', 'firstName'=>'required', 'lastName'=>'required'
+        ]);
+        $resp = stro_wallet_create_user($data); // wrapper interne
+        return response()->json($resp, $resp['success'] ? 200 : 400);
+    }
+
+    public function balance($currency){
+        $bal = strowalletBalance($currency); // Existant: strowalletBalance()
+        if(isset($bal['balance'])) return response()->json(['success'=>true,'balance'=>$bal['balance']]);
+        return response()->json(['success'=>false,'message'=>$bal['message']??'Unable'], 400);
+    }
+
+    public function createCard(Request $r){
+        $data = $r->validate([
+            'name_on_card'=>'required|min:2',
+            'amount'=>'required|numeric|min:1',
+            'currency'=>'required|size:3',
+            'customerEmail'=>'required|email'
+        ]);
+        // Pré-vérification balance
+        $bal = strowalletBalance($data['currency']);
+        if(!isset($bal['balance']) || $bal['balance'] < $data['amount']){
+            return response()->json(['success'=>false,'error_code'=>'INSUFFICIENT_BALANCE','message'=>'Balance insuffisante'], 422);
+        }
+        $resp = create_strowallet_virtual_card($data); // doit inclure currency dans payload
+        if(!$resp['success'] && str_contains(($resp['message']??'').'Server Error')){
+            return response()->json(['success'=>false,'message'=>'Remote server error','remote'=>$resp], 502);
+        }
+        return response()->json($resp, $resp['success']?200:400);
+    }
+
+    public function cardDetail(Request $r){
+        $id = $r->validate(['card_id'=>'required|string']);
+        $resp = card_details($id['card_id']);
+        return response()->json($resp, $resp['success']?200:400);
+    }
+}
+```
+
+Patch Helper PHP (currency)
+---------------------------
+Dans `create_strowallet_virtual_card` s’assurer:
+```php
+'currency' => $formData['currency'], // ajouté
+```
+Sinon le serveur Strowallet répond 500 ou erreur générique.
+
+Payloads Principaux
+-------------------
+Création Client (`create-user/`): form-encoded
+- public_key
+- firstName, lastName
+- customerEmail
+- idType, idImage, userPhoto (si disponibles)
+- dateOfBirth, phoneNumber, address...
+
+Création Carte (`create-card/`): JSON
+```json
+{
+  "public_key": "<VOTRE_PUBLIC_KEY>",
+  "name_on_card": "John D",
+  "card_type": "visa",
+  "amount": 25.00,
+  "currency": "USD",
+  "customerEmail": "john@example.com",
+  "developer_code": "appdevsx"
+}
+```
+Optionnel sandbox:
+```json
+"mode": "sandbox"
+```
+
+Réponses (exemples synthétiques)
+--------------------------------
+Succès carte:
+```json
+{ "success": true, "response": { "card_id": "...", "card_detail": { "card_status": "active", "last4": "1234", "currency": "USD", "balance": 25 } } }
+```
+Erreur solde:
+```json
+{ "success": false, "error_code": "CARD_CREATION_ERROR", "message": "Insufficient balance." }
+```
+Erreur serveur générique mappée:
+```json
+{ "success": false, "message": "Remote server error", "remote": { "success": false, "message": "Server Error" } }
+```
+
+Intégration React – Service Layer
+---------------------------------
+Organisation recommandée:
+```
+resources/js/
+  api/strowallet.ts
+  components/cards/
+  hooks/useStrowallet.ts
+```
+Service API:
+```ts
+// resources/js/api/strowallet.ts
+export async function createCard(input:{name_on_card:string;amount:number;currency:string;customerEmail:string}){
+  const r = await fetch('/api/strowallet/card', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(input)});
+  const d = await r.json(); if(!d.success) throw new Error(d.message||'Card error'); return d.response;
+}
+export async function fetchBalance(currency='USD'){
+  const r = await fetch(`/api/strowallet/balance/${currency}`); const d = await r.json(); if(!d.success) throw new Error(d.message||'Balance error'); return d.balance;
+}
+```
+Hook:
+```ts
+import { useState, useCallback } from 'react';
+import { createCard, fetchBalance } from '../api/strowallet';
+export function useStrowallet(){
+  const [loading,setLoading] = useState(false); const [error,setError]=useState<string|null>(null);
+  const doCreate = useCallback(async (p:any)=>{ setLoading(true); setError(null); try{ return await createCard(p); } catch(e:any){ setError(e.message); throw e; } finally{ setLoading(false); } },[]);
+  return { loading, error, createCard:doCreate, fetchBalance };
+}
+```
+
+Formulaire React (Bootstrap)
+----------------------------
+```tsx
+<form onSubmit={onSubmit} className="card-create-form">
+  <div className="mb-3">
+    <label className="form-label">Name on Card</label>
+    <input className="form-control" value={name} onChange={e=>setName(e.target.value)} required />
+  </div>
+  <div className="mb-3">
+    <label className="form-label">Amount</label>
+    <input type="number" min={1} className="form-control" value={amount} onChange={e=>setAmount(Number(e.target.value))} required />
+  </div>
+  <div className="mb-3">
+    <label className="form-label">Currency</label>
+    <select className="form-select" value={currency} onChange={e=>setCurrency(e.target.value)}>
+      <option value="USD">USD</option>
+    </select>
+  </div>
+  <button className="btn btn-primary" disabled={loading}>Create Card</button>
+  {error && <div className="alert alert-danger mt-3">{error}</div>}
+</form>
+```
+
+Build & Vite
+------------
+1. Installer React si non présent (`npm install react react-dom`).
+2. Dans `vite.config.js` s’assurer entrée: `resources/js/app.tsx`.
+3. Blade: `@vite('resources/js/app.tsx')`.
+4. Lancer: `npm run dev` → hot reload.
+
+Sécurité & Bonnes Pratiques
+---------------------------
+- Clé publique jamais dans code client; définie via `.env` et utilisée seulement par helpers PHP.
+- Validation serveur + validation client (double barrière).
+- Rate limiting basique: middleware compteur par IP / user pour création carte.
+- Journaliser erreurs Strowallet avec niveau `warning` + corrélation (request id).
+- CSRF: pour endpoints web classiques; pour API JSON utiliser token ou Sanctum.
+- CORS: Configurer `config/cors.php` si React servi depuis autre domaine.
+
+Gestion des Erreurs
+-------------------
+Catégories:
+- 422 Validation locale (champs invalides / solde insuffisant).
+- 400 Erreur logique Strowallet (email client manquant, etc.).
+- 502 Proxy: erreur serveur distant générique ("Server Error").
+Affichage React: mapping message utilisateur clair + action (recharger solde / corriger champ).
+
+Stockage Métadonnées Cartes
+---------------------------
+Créer table `strowallet_cards` (si pas existante) pour garder: `card_id, name_on_card, currency, balance, card_status, last4, expiry`. Pas de PAN, pas de CVV.
+
+Webhook (Optionnel)
+-------------------
+Route: POST `/api/strowallet/webhook`.
+- Vérifier signature (si fournie).
+- Mettre à jour `card_status` ou balance.
+- Logger payload complet dans table `strowallet_webhooks`.
+
+Checklist
+---------
+- [ ] Helper carte inclut `currency`.
+- [ ] Endpoints Laravel créés + protégés auth.
+- [ ] React form valide tous champs avant POST.
+- [ ] Gestion insuffisance de solde (pré-fetch balance).
+- [ ] Mapping erreurs côté React.
+- [ ] Rate limiting basique.
+- [ ] Webhook route (future) prête.
+
+Stratégie de Migration (Depuis Code PHP Pur)
+-------------------------------------------
+1. Isoler fonctions Strowallet dans un Service (`app/Services/StrowalletService.php`).
+2. Créer controller dédié API (`StrowalletController`).
+3. Ajouter tests unitaires payload (PHPUnit) pour createCard.
+4. Introduire React progressivement sur une page (Progressive Enhancement). 
+5. Déplacer logique d'affichage carte dans React après validation.
+
+Tests Rapides
+-------------
+PHPUnit exemple (pseudo):
+```php
+public function test_create_card_requires_currency(){
+  $resp = $this->postJson('/api/strowallet/card',[ 'name_on_card'=>'A','amount'=>10,'customerEmail'=>'a@b.c' ]);
+  $resp->assertStatus(422);
+}
+```
+
+Références Critiques
+--------------------
+- Champ `currency` obligatoire dans tout payload `create-card`.
+- Balance endpoint GET seulement.
+- Sandbox: ajouter `mode:"sandbox"` et utiliser clé/stats sandbox.
+
+Extension Futur
+---------------
+- Funding endpoint (si exposé plus tard).
+- Portefeuille multi-devise (boucle sur devise config).
+- Dashboard admin (stats agrégées sur cartes actives).
+
+Résumé
+------
+Ce document décrit une intégration directe React ↔ Laravel pour Strowallet en réutilisant les helpers PHP et en ajoutant une couche API propre, avec sécurité (clé côté serveur), validations, gestion solde, mapping erreurs, et structure de migration progressive.

@@ -1,0 +1,154 @@
+Strowallet – Dépannage Erreur Création Carte (400 / "Server Error")
+===============================================================
+
+Contexte
+--------
+Edge Function retour: `{"success":false,"error":"Strowallet API error: Server Error"}` avec HTTP 400. Cela indique que votre fonction intermédiaire a intercepté une réponse Strowallet générique (probablement 500 interne) ou une réponse non conforme et l'a mappée vers `400`. L'erreur est souvent due à un problème de payload, prérequis non rempli (solde, KYC), devise, ou mismatch sandbox/production.
+
+Causes Probables
+----------------
+1. `currency` manquante ou incorrecte (non supportée ➜ 500 interne côté Strowallet).
+2. Solde principal insuffisant (mais parfois renvoie un message explicite; d'autres fois un "Server Error").
+3. Client (customerEmail) non validé/ statut KYC pas au niveau requis (ex: high_kyc attendu mais status low_kyc).
+4. Mode sandbox mal utilisé: `mode:"sandbox"` envoyé avec une clé live ou inversement.
+5. `amount` type incorrect (string non numérisée, valeur < min limit, trop grande).
+6. Serveur Strowallet en surcharge (réponse 500 générique).
+7. Header manquant ou mal formé (rare ici: Accept / content-type déjà OK).
+8. `developer_code` non reconnu (tester sans).
+9. JSON mal sérialisé (encoding double ou BOM).
+
+Check List Immédiate
+--------------------
+1. Afficher payload réel TRÈS exactement juste avant fetch.
+2. Tester la requête brute avec curl.
+3. Vérifier la balance via endpoint GET balance.
+4. Vérifier statut client côté base locale (KYC level).
+5. Retirer temporairement `developer_code` et `mode` pour isoler.
+6. Réduire `amount` à un montant faible (ex: 1.00) pour test.
+7. Tester une autre devise supportée (si liste fournie; sinon rester sur USD).
+
+Exemple curl
+------------
+```bash
+curl -v -H "accept: application/json" -H "content-type: application/json" \
+  -d '{"public_key":"1JA6RG3ED5XPKPJQ7B2W54QHOJJGKV","name_on_card":"Test User","card_type":"visa","amount":5.00,"currency":"USD","customerEmail":"test.user@example.com","developer_code":"appdevsx"}' \
+  https://strowallet.com/api/create-card/
+```
+(Si sandbox: ajouter `,"mode":"sandbox"`.)
+
+Vérification Balance
+--------------------
+```bash
+curl -s -H "accept: application/json" "https://strowallet.com/api/wallet/balance/USD/?public_key=1JA6RG3ED5XPKPJQ7B2W54QHOJJGKV"
+```
+Si absence de `balance`, corriger avant toute création.
+
+Code Edge Function Amélioré (Logging + Mapping)
+-----------------------------------------------
+```ts
+import { serve } from "https://deno.land/std/http/server.ts";
+import { STROWALLET_PUBLIC_KEY, STROWALLET_BASE_URL, STROWALLET_MODE } from "../_shared/env.ts";
+
+interface CreatePayload {
+  name_on_card:string; amount:number; currency:string; customerEmail:string;
+}
+
+function validate(p:CreatePayload){
+  const errors:string[] = [];
+  if(!p.name_on_card || p.name_on_card.trim().length < 2) errors.push("Invalid name_on_card");
+  if(typeof p.amount !== "number" || !isFinite(p.amount) || p.amount <= 0) errors.push("Invalid amount");
+  if(!p.currency || !/^[A-Z]{3}$/.test(p.currency)) errors.push("Invalid currency");
+  if(!p.customerEmail || !/.+@.+\..+/.test(p.customerEmail)) errors.push("Invalid customerEmail");
+  return errors;
+}
+
+serve(async (req) => {
+  const start = Date.now();
+  try {
+    const body = await req.json();
+    const { name_on_card, amount, currency, customerEmail } = body as CreatePayload;
+    const v = validate({ name_on_card, amount, currency, customerEmail });
+    if(v.length) return new Response(JSON.stringify({ success:false, message:"Validation failed", errors:v }), { status:422 });
+
+    const payload:Record<string,unknown> = {
+      public_key: STROWALLET_PUBLIC_KEY,
+      name_on_card,
+      card_type: "visa",
+      amount: Number(amount),
+      currency,
+      customerEmail,
+      developer_code: "appdevsx"
+    };
+    if(STROWALLET_MODE === "sandbox") payload.mode = "sandbox";
+
+    console.log("[create-card] outbound payload", JSON.stringify(payload));
+
+    const resp = await fetch(STROWALLET_BASE_URL+"create-card/", {
+      method:"POST",
+      headers:{ "accept":"application/json", "content-type":"application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    const text = await resp.text();
+    let data:any; try { data = JSON.parse(text); } catch { data = { parse_error:true, raw:text }; }
+
+    console.log("[create-card] status", resp.status, "body", text.substring(0,500));
+
+    if(resp.ok && data?.success){
+      return new Response(JSON.stringify(data), { status:200 });
+    }
+
+    // Mutualiser les erreurs
+    const apiMessage = data?.message || data?.error || "Unknown remote error";
+    const mappedStatus = resp.status >= 500 ? 502 : 400; // 502 pour signaler serveur en amont
+
+    return new Response(JSON.stringify({ success:false, message: apiMessage, remote_status: resp.status, raw: data }), { status: mappedStatus });
+  } catch(e:any){
+    console.error("[create-card] exception", e);
+    return new Response(JSON.stringify({ success:false, message:"Edge exception", detail:e.message }), { status:500 });
+  } finally {
+    console.log("[create-card] total_ms", Date.now()-start);
+  }
+});
+```
+
+Analyse de la Réponse
+---------------------
+Inspecter:
+- `remote_status` (ex: 500) pour distinguer erreur Strowallet vs validation locale.
+- `raw` pour voir la structure réelle retournée.
+- `errors` (422) pour erreurs locales.
+
+Scénarios & Solutions
+---------------------
+| Situation | Action |
+|-----------|--------|
+| remote_status = 500, message générique | Retester avec payload minimal, retirer developer_code, vérifier balance. |
+| remote_status = 500, parse_error:true | Strowallet renvoie HTML ou vide: contacter support. |
+| remote_status = 400, message "Customer with this email not found" | Recréer client (create-user), vérifier exactitude email. |
+| remote_status = 400, message currency related | Confirmer devise supportée. |
+| Validation failed (422) | Corriger champs listés. |
+| Edge exception (500 local) | Erreur JSON.parse ou fetch: ajouter retry réseau. |
+
+Retry Réseau (Optionnel)
+------------------------
+Ajouter un simple retry sur erreurs réseau (ECONNRESET / TypeError) mais jamais sur validation.
+
+Curl de Test Minimal
+--------------------
+```bash
+curl -v -H "accept: application/json" -H "content-type: application/json" \
+  -d '{"public_key":"1JA6RG3ED5XPKPJQ7B2W54QHOJJGKV","name_on_card":"U Test","card_type":"visa","amount":1.00,"currency":"USD","customerEmail":"test.user@example.com"}' \
+  https://strowallet.com/api/create-card/
+```
+
+Prochaines Étapes Recommandées
+------------------------------
+1. Mettre à jour l'Edge Function avec logs ci-dessus.
+2. Reproduire l'appel et capturer `remote_status` + `raw`.
+3. Partager la partie `raw` (masquer infos sensibles) si encore échec.
+4. Si toujours generic server error: vérifier côté PHP original si même payload => comparer.
+
+Résumé
+------
+L'erreur "Server Error" est le symptôme; la cause réelle est souvent un prérequis invalide (currency, solde, client) ou mismatch mode. Avec une edge function enrichie en logs et une série de tests curl isolés, vous pouvez rapidement localiser la source et corriger.

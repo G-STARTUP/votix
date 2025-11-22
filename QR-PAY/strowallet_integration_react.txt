@@ -1,0 +1,750 @@
+Strowallet Integration Reference + React + Supabase Examples
+============================================================
+
+I. Existing Laravel Integration (Summary)
+----------------------------------------
+Models:
+- App\Models\StrowalletVirtualCard: stores card info (user_id, card_id, balance, status, currency, etc.)
+- App\Models\StrowalletWebhookData: stores webhook event payloads (parent_id, user_id, event, cardId, transaction_id, data)
+- App\Models\StrowalletCustomerKyc: stores KYC info for user/customer pairing
+- App\Models\VirtualCardApi: single config record with JSON config (strowallet_public_key, strowallet_secret_key, strowallet_url, strowallet_mode, card_limit)
+
+Helpers (app/Http/Helpers/strowallet-card.php):
+- stro_wallet_create_user(formData, public_key, base_url, idImage, userPhoto)
+- get_customer(public_key, base_url, customerId, customerEmail)
+- update_customer(formData, public_key, base_url, idImage, userPhoto, customer)
+- create_strowallet_virtual_card(user, cardAmount, customer, public_key, base_url, formData)
+- card_details(card_id, public_key, base_url)
+- strowalletBalance()
+- updateStroWalletCardBalance(user, card_id, response)
+
+Controllers (Web):
+- StrowalletVirtualController: user flows (create customer, update customer, create card, fund card, view transactions, webhook listing)
+  - getWebhookData(Request): stores raw webhook POST payload into StrowalletWebhookData (no signature verification yet)
+
+Controllers (API):
+- Api\User\StrowalletVirtualCardController: parallels web controller for mobile/API usage
+
+Routes Web (routes/user.php):
+Prefix: /user/strowallet-virtual-card/
+Key endpoints:
+- GET / (index)
+- GET create (createPage)
+- POST create/customer
+- PUT update/customer
+- POST create (cardBuy)
+- GET fund/page/{id}
+- POST fund
+- GET details/{card_id}
+- GET transaction/{card_id}
+- GET webhook/transaction/{card_id}
+- POST webhook (public endpoint for webhook ingestion)
+
+Routes API (routes/api/api.php):
+Prefix: /api/strowallet-card/
+Key endpoints:
+- GET / (index)
+- GET charges
+- GET create/info
+- POST create/customer
+- POST update/customer
+- POST create (cardBuy)
+- POST fund
+- GET details
+- GET transaction
+- POST block / unblock
+- GET webhook (list events)
+
+Security Gap:
+- Current webhook ingestion lacks HMAC/signature validation and replay protection. Should add: X-Strowallet-Signature header (HMAC SHA256 over raw body with secret) + idempotency check by event id.
+
+II. Target React + Supabase Architecture
+----------------------------------------
+Goal: Re-implement integration on a different platform (React frontend + Supabase backend) with secure webhook handling and storage.
+
+Components:
+1. React Frontend (Next.js or Vite React)
+   - UI forms: Create Customer, Create Card, Fund Card, Card Details, Transactions, Webhook Events.
+   - Hooks / API client wrapper for Strowallet endpoints.
+2. Backend (Supabase Edge Functions or external Node/Express server):
+   - Relay secure server-side calls to Strowallet (hide secret keys).
+   - Webhook endpoint (POST /webhooks/strowallet) verifying signature and persisting events in Supabase tables.
+3. Supabase Database Tables:
+   - strowallet_customers: id (uuid), user_id (uuid), customer_id (text), customer_email (text), data (jsonb), created_at
+   - strowallet_cards: id (uuid), user_id (uuid), card_id (text unique), name_on_card (text), card_type (text), balance (numeric), currency (text), status (text), expiry (text), last4 (text), cvv (text encrypted or stored server-side only), raw_response (jsonb), created_at, updated_at
+   - strowallet_webhook_events: id (uuid), event_id (text), card_id (text), user_id (uuid), event_type (text), payload (jsonb), inserted_at, signature_valid (boolean)
+   - strowallet_config: singleton row or use environment variables (public_key, secret_key, base_url, mode)
+
+Environment Variables (.env.local):
+NEXT_PUBLIC_STROWALLET_PUBLIC_KEY=...
+STROWALLET_SECRET_KEY=...   (server-side only)
+STROWALLET_BASE_URL=https://strowallet.com/api/
+STROWALLET_MODE=sandbox
+STROWALLET_WEBHOOK_SECRET=... (for HMAC verification if provided or create your own shared secret)
+SUPABASE_URL=...
+SUPABASE_ANON_KEY=...
+SUPABASE_SERVICE_ROLE_KEY=... (server-side only)
+
+III. HMAC Signature Proposal
+----------------------------
+Computed header: X-Strowallet-Signature = hex(HMAC_SHA256( raw_body, STROWALLET_WEBHOOK_SECRET ))
+Verification:
+- Recompute digest; compare using constant-time compare.
+- Reject if timestamp drift > 5 minutes (include X-Strowallet-Timestamp header and sign body+timestamp).
+- Enforce idempotency: if event_id already exists, ignore.
+
+IV. React API Client (Frontend) - src/lib/strowalletClient.js
+------------------------------------------------------------
+NOTE: Direct calls that require secret key must go through backend proxy endpoints.
+
+```javascript
+// src/lib/strowalletClient.js
+export class StrowalletClient {
+  constructor({ baseUrl, publicKey, mode }) {
+    this.baseUrl = baseUrl.endsWith('/') ? baseUrl : baseUrl + '/';
+    this.publicKey = publicKey;
+    this.mode = mode || 'sandbox';
+  }
+
+  async createCustomer(form) {
+    // Call your backend proxy: /api/strowallet/create-customer
+    const res = await fetch('/api/strowallet/create-customer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(form)
+    });
+    if (!res.ok) throw new Error('Failed to create customer');
+    return res.json();
+  }
+
+  async getCustomer(customerId, customerEmail) {
+    const qs = new URLSearchParams({ customerId, customerEmail }).toString();
+    const res = await fetch(`/api/strowallet/get-customer?${qs}`);
+    if (!res.ok) throw new Error('Failed to fetch customer');
+    return res.json();
+  }
+
+  async updateCustomer(data) {
+    const res = await fetch('/api/strowallet/update-customer', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data)
+    });
+    if (!res.ok) throw new Error('Failed to update customer');
+    return res.json();
+  }
+
+  async createCard({ amount, customerEmail, nameOnCard }) {
+    const payload = { amount, customerEmail, name_on_card: nameOnCard };
+    const res = await fetch('/api/strowallet/create-card', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error('Failed to create card');
+    return res.json();
+  }
+
+  async cardDetails(cardId) {
+    const res = await fetch(`/api/strowallet/card-details?card_id=${encodeURIComponent(cardId)}`);
+    if (!res.ok) throw new Error('Failed to fetch card details');
+    return res.json();
+  }
+
+  async balance(currencyCode = 'USD') {
+    const res = await fetch(`/api/strowallet/balance?currency=${currencyCode}`);
+    if (!res.ok) throw new Error('Failed to fetch balance');
+    return res.json();
+  }
+}
+```
+
+V. Backend Proxy (Next.js API Routes or Express) - Example Express Server
+-------------------------------------------------------------------------
+```javascript
+// server/strowalletProxy.js
+import express from 'express';
+import fetch from 'node-fetch';
+import crypto from 'crypto';
+import { createClient } from '@supabase/supabase-js';
+
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+
+const {
+  STROWALLET_SECRET_KEY,
+  STROWALLET_PUBLIC_KEY,
+  STROWALLET_BASE_URL,
+  STROWALLET_MODE,
+  STROWALLET_WEBHOOK_SECRET,
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY
+} = process.env;
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+function strowalletApiPath(path) {
+  return STROWALLET_BASE_URL.replace(/\/$/, '') + '/' + path;
+}
+
+async function callStrowallet(path, method = 'POST', bodyObj) {
+  const body = bodyObj ? JSON.stringify(bodyObj) : undefined;
+  const res = await fetch(strowalletApiPath(path), {
+    method,
+    headers: { 'Content-Type': 'application/json', 'accept': 'application/json' },
+    body
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || json.success === false) {
+    throw new Error(json.message || `Strowallet error (${res.status})`);
+  }
+  return json;
+}
+
+app.post('/api/strowallet/create-customer', async (req, res) => {
+  try {
+    const form = req.body; // Validate schema
+    const payload = {
+      public_key: STROWALLET_PUBLIC_KEY,
+      houseNumber: form.house_number,
+      firstName: form.first_name,
+      lastName: form.last_name,
+      idNumber: form.id_number || Math.floor(Math.random()*1e9),
+      customerEmail: form.customer_email,
+      phoneNumber: form.phone,
+      dateOfBirth: form.date_of_birth,
+      idImage: form.id_image || '',
+      userPhoto: form.user_photo || '',
+      line1: form.address,
+      state: form.state || 'Accra',
+      zipCode: form.zip_code,
+      city: form.city || 'Accra',
+      country: form.country || 'Ghana',
+      idType: form.id_type || 'PASSPORT',
+    };
+    const json = await callStrowallet('create-user/', 'POST', payload);
+    // Persist in Supabase
+    const customer = json.response;
+    await supabase.from('strowallet_customers').insert({
+      user_id: form.user_id,
+      customer_id: customer.customerId,
+      customer_email: customer.customerEmail,
+      data: customer
+    });
+    res.json({ success: true, customer });
+  } catch (e) {
+    res.status(400).json({ success: false, message: e.message });
+  }
+});
+
+app.get('/api/strowallet/get-customer', async (req, res) => {
+  try {
+    const { customerId, customerEmail } = req.query;
+    const url = strowalletApiPath(`getcardholder/?public_key=${encodeURIComponent(STROWALLET_PUBLIC_KEY)}&customerId=${encodeURIComponent(customerId)}&customerEmail=${encodeURIComponent(customerEmail)}`);
+    const raw = await fetch(url, { headers: { accept: 'application/json' } });
+    const json = await raw.json();
+    res.json(json);
+  } catch (e) {
+    res.status(400).json({ success: false, message: e.message });
+  }
+});
+
+app.put('/api/strowallet/update-customer', async (req, res) => {
+  try {
+    const { customerId, firstName, lastName, idImage, userPhoto } = req.body;
+    const url = strowalletApiPath(`updateCardCustomer/?public_key=${encodeURIComponent(STROWALLET_PUBLIC_KEY)}&customerId=${encodeURIComponent(customerId)}&firstName=${encodeURIComponent(firstName)}&lastName=${encodeURIComponent(lastName)}&idImage=${encodeURIComponent(idImage||'')}&userPhoto=${encodeURIComponent(userPhoto||'')}`);
+    const raw = await fetch(url, { method: 'PUT', headers: { accept: 'application/json' } });
+    const json = await raw.json();
+    if (!json.success) throw new Error(json.message || 'Update failed');
+    res.json(json);
+  } catch (e) {
+    res.status(400).json({ success: false, message: e.message });
+  }
+});
+
+app.post('/api/strowallet/create-card', async (req, res) => {
+  try {
+    const { amount, customerEmail, name_on_card } = req.body;
+    const payload = {
+      name_on_card: name_on_card,
+      card_type: 'visa',
+      public_key: STROWALLET_PUBLIC_KEY,
+      amount,
+      customerEmail,
+      developer_code: 'appdevsx',
+      ...(STROWALLET_MODE === 'sandbox' ? { mode: 'sandbox' } : {})
+    };
+    const json = await callStrowallet('create-card/', 'POST', payload);
+    const card = json.response;
+    await supabase.from('strowallet_cards').insert({
+      card_id: card.card_id,
+      user_id: req.body.user_id,
+      name_on_card: card.name_on_card,
+      card_type: card.card_type,
+      balance: card.amount || 0,
+      currency: card.currency || 'USD',
+      status: card.card_status,
+      raw_response: card
+    });
+    res.json({ success: true, card });
+  } catch (e) {
+    res.status(400).json({ success: false, message: e.message });
+  }
+});
+
+app.get('/api/strowallet/card-details', async (req, res) => {
+  try {
+    const { card_id } = req.query;
+    const payload = {
+      public_key: STROWALLET_PUBLIC_KEY,
+      card_id,
+      ...(STROWALLET_MODE === 'sandbox' ? { mode: 'sandbox' } : {})
+    };
+    const json = await callStrowallet('fetch-card-detail/', 'POST', payload);
+    res.json(json);
+  } catch (e) {
+    res.status(400).json({ success: false, message: e.message });
+  }
+});
+
+app.get('/api/strowallet/balance', async (req, res) => {
+  try {
+    const currency = req.query.currency || 'USD';
+    const url = `https://strowallet.com/api/wallet/balance/${currency}/?public_key=${encodeURIComponent(STROWALLET_PUBLIC_KEY)}`;
+    const raw = await fetch(url, { headers: { accept: 'application/json' } });
+    const json = await raw.json();
+    res.json(json);
+  } catch (e) {
+    res.status(400).json({ success: false, message: e.message });
+  }
+});
+
+// Webhook Endpoint
+app.post('/webhooks/strowallet', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const signature = req.get('X-Strowallet-Signature');
+    const timestamp = req.get('X-Strowallet-Timestamp');
+    const bodyBuffer = req.body; // raw body buffer
+    if (!signature || !timestamp) throw new Error('Missing signature headers');
+
+    // Timestamp check
+    const drift = Math.abs(Date.now() - Number(timestamp));
+    if (drift > 5 * 60 * 1000) throw new Error('Timestamp drift too large');
+
+    const expected = crypto.createHmac('sha256', STROWALLET_WEBHOOK_SECRET).update(bodyBuffer).digest('hex');
+    const valid = crypto.timingSafeEqual(Buffer.from(signature, 'hex'), Buffer.from(expected, 'hex'));
+    if (!valid) throw new Error('Invalid signature');
+
+    const payloadStr = bodyBuffer.toString('utf8');
+    const payload = JSON.parse(payloadStr);
+
+    const eventId = payload.id || payload.event_id || crypto.randomUUID();
+
+    // Idempotency check
+    const { data: existing } = await supabase.from('strowallet_webhook_events').select('event_id').eq('event_id', eventId).limit(1);
+    if (existing && existing.length) {
+      return res.status(200).json({ success: true, duplicate: true });
+    }
+
+    await supabase.from('strowallet_webhook_events').insert({
+      event_id: eventId,
+      card_id: payload.cardId || null,
+      user_id: null, // Optionally map via card lookup
+      event_type: payload.event,
+      payload,
+      signature_valid: true
+    });
+
+    res.json({ success: true });
+  } catch (e) {
+    res.status(400).json({ success: false, message: e.message });
+  }
+});
+
+export default app;
+
+// To start: node server/strowalletProxy.js (with proper express listen wrapper elsewhere)
+```
+
+VI. React Hooks Example - src/hooks/useStrowallet.js
+----------------------------------------------------
+```javascript
+import { useState, useCallback } from 'react';
+import { StrowalletClient } from '../lib/strowalletClient';
+
+const client = new StrowalletClient({
+  baseUrl: process.env.NEXT_PUBLIC_STROWALLET_BASE_URL,
+  publicKey: process.env.NEXT_PUBLIC_STROWALLET_PUBLIC_KEY,
+  mode: process.env.NEXT_PUBLIC_STROWALLET_MODE
+});
+
+export function useStrowallet() {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const wrap = useCallback(fn => async (...args) => {
+    setLoading(true); setError(null);
+    try { return await fn(...args); } catch (e) { setError(e.message); throw e; } finally { setLoading(false); }
+  }, []);
+
+  return {
+    loading,
+    error,
+    createCustomer: wrap(client.createCustomer.bind(client)),
+    getCustomer: wrap(client.getCustomer.bind(client)),
+    updateCustomer: wrap(client.updateCustomer.bind(client)),
+    createCard: wrap(client.createCard.bind(client)),
+    cardDetails: wrap(client.cardDetails.bind(client)),
+    balance: wrap(client.balance.bind(client)),
+  };
+}
+```
+
+VII. Supabase Table DDL (SQL examples)
+-------------------------------------
+```sql
+create table if not exists strowallet_customers (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id) on delete set null,
+  customer_id text not null,
+  customer_email text not null,
+  data jsonb,
+  created_at timestamptz default now()
+);
+create unique index on strowallet_customers(customer_id);
+
+create table if not exists strowallet_cards (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id) on delete set null,
+  card_id text not null,
+  name_on_card text,
+  card_type text,
+  balance numeric default 0,
+  currency text,
+  status text,
+  expiry text,
+  last4 text,
+  cvv text, -- consider storing encrypted or omit; fetch on demand only
+  raw_response jsonb,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+create unique index on strowallet_cards(card_id);
+
+create table if not exists strowallet_webhook_events (
+  id uuid primary key default gen_random_uuid(),
+  event_id text not null,
+  card_id text,
+  user_id uuid references auth.users(id) on delete set null,
+  event_type text,
+  payload jsonb,
+  signature_valid boolean default false,
+  inserted_at timestamptz default now()
+);
+create unique index on strowallet_webhook_events(event_id);
+```
+
+VIII. Minimal Create Customer Form (React)
+------------------------------------------
+```jsx
+// src/components/CreateStrowalletCustomerForm.jsx
+import { useState } from 'react';
+import { useStrowallet } from '../hooks/useStrowallet';
+
+export default function CreateStrowalletCustomerForm({ userId }) {
+  const { createCustomer, loading, error } = useStrowallet();
+  const [form, setForm] = useState({ first_name: '', last_name: '', customer_email: '', phone: '', date_of_birth: '', address: '', zip_code: '' });
+  const [result, setResult] = useState(null);
+
+  const submit = async e => {
+    e.preventDefault();
+    const res = await createCustomer({ ...form, user_id: userId, house_number: form.address.split(' ')[0] || '1' });
+    setResult(res.customer);
+  };
+
+  return (
+    <form onSubmit={submit}>
+      <input placeholder='First Name' value={form.first_name} onChange={e=>setForm(f=>({...f, first_name:e.target.value}))} />
+      <input placeholder='Last Name' value={form.last_name} onChange={e=>setForm(f=>({...f, last_name:e.target.value}))} />
+      <input placeholder='Email' value={form.customer_email} onChange={e=>setForm(f=>({...f, customer_email:e.target.value}))} />
+      <input placeholder='Phone' value={form.phone} onChange={e=>setForm(f=>({...f, phone:e.target.value}))} />
+      <input placeholder='Date of Birth YYYY-MM-DD' value={form.date_of_birth} onChange={e=>setForm(f=>({...f, date_of_birth:e.target.value}))} />
+      <input placeholder='Address' value={form.address} onChange={e=>setForm(f=>({...f, address:e.target.value}))} />
+      <input placeholder='ZIP Code' value={form.zip_code} onChange={e=>setForm(f=>({...f, zip_code:e.target.value}))} />
+      <button disabled={loading}>Create Customer</button>
+      {error && <p style={{color:'red'}}>{error}</p>}
+      {result && <pre>{JSON.stringify(result, null, 2)}</pre>}
+    </form>
+  );
+}
+```
+
+IX. Webhook Signature Generation (If Strowallet does not provide one)
+---------------------------------------------------------------------
+If provider lacks signatures, you can set up a reverse proxy that adds your own signature for internal trust, or require a custom shared secret appended as query param & compute HMAC on their payload if they allow transformation.
+
+X. Migration Checklist from Laravel to React/Supabase
+-----------------------------------------------------
+1. Extract all required fields from VirtualCardApi (public_key, secret_key, url, mode). Map to .env.
+2. Recreate tables in Supabase (customers, cards, webhook_events).
+3. Implement server proxy endpoints (avoid exposing secret key in JS bundle).
+4. Implement webhook endpoint with HMAC + idempotency.
+5. Port business logic: create user -> create card -> fund card (if funding endpoint exists) -> fetch card details -> update balance.
+6. Rebuild UI with React forms and state hooks.
+7. Add error handling and loading states.
+8. Add observability (console logs -> Supabase logs / monitoring).
+
+XI. Future Enhancements
+-----------------------
+- Add rate limiting on proxy endpoints.
+- Encrypt sensitive fields (cvv) or omit storage.
+- Add retry & exponential backoff for transient Strowallet failures.
+- Integrate background jobs (Supabase Edge Functions / Cron) to refresh balances periodically.
+- Add monitoring dashboard for webhook delivery and signature validation failures.
+
+XII. Sample .env.local
+----------------------
+```
+NEXT_PUBLIC_STROWALLET_PUBLIC_KEY=pk_live_xxx
+STROWALLET_SECRET_KEY=sk_live_xxx
+NEXT_PUBLIC_STROWALLET_BASE_URL=https://strowallet.com/api/
+NEXT_PUBLIC_STROWALLET_MODE=sandbox
+STROWALLET_WEBHOOK_SECRET=whsec_xxx
+SUPABASE_URL=https://xxxxx.supabase.co
+SUPABASE_ANON_KEY=public-anon-key
+SUPABASE_SERVICE_ROLE_KEY=service-role-key
+```
+
+XIII. Testing Commands (Node)
+-----------------------------
+```bash
+# Start dev server (Express example)
+node server/index.js
+
+# Send test webhook
+curl -X POST http://localhost:3000/webhooks/strowallet \
+  -H 'Content-Type: application/json' \
+  -H 'X-Strowallet-Timestamp: '"$(date +%s)" \
+  -H 'X-Strowallet-Signature: '$(node -e "const c=require('crypto');const s=process.env.STROWALLET_WEBHOOK_SECRET||'test';const b='{"id":"evt_1","event":"transaction","cardId":"card_123"}';console.log(c.createHmac('sha256',s).update(b).digest('hex'))") \
+  -d '{"id":"evt_1","event":"transaction","cardId":"card_123"}'
+```
+
+End of File.
+
+XIV. Card Image Rendering (React UI)
+------------------------------------
+Goal: Afficher une carte virtuelle (marque, numéro masqué, solde) de façon cohérente avec les données Strowallet.
+
+Source des données:
+1. Réponse de création de carte ou `card-details`: champs disponibles (ex: `card_number`, `last4`, `card_status`, `balance`, `currency`, `name_on_card`, `card_type`).
+2. Dans l’intégration Laravel existante, la marque est forcée à `visa` (champ `card_brand`). Si Strowallet fournit un type différent, adapter dynamiquement.
+
+Masquage numéro:
+Front ne doit afficher que: `**** **** **** 1234` (où `1234 = last4`). Si le backend renvoie déjà `last4`, ne jamais reconstruire les autres digits côté client.
+
+Couleurs / thèmes:
+- VISA: dégradé bleu (#1a4dd9 -> #4779ff)
+- MASTERCARD: cercles dégradés rouge/orange
+- SANDBOX (mode test): ajoute un badge "SANDBOX" jaune.
+
+Assets:
+Placer les logos dans `public/card-brands/visa.svg`, `public/card-brands/mastercard.svg`. Pour un fallback générique: `generic.svg`.
+
+React Component: `src/components/CardPreview.jsx`
+```jsx
+import React from 'react';
+
+const brandStyle = brand => {
+  switch (brand?.toLowerCase()) {
+    case 'visa':
+      return { background: 'linear-gradient(135deg,#1a4dd9,#4779ff)', color: '#fff' };
+    case 'mastercard':
+      return { background: 'linear-gradient(135deg,#ff8800,#ff2d55)', color: '#fff' };
+    default:
+      return { background: 'linear-gradient(135deg,#2f2f2f,#555)', color: '#eee' };
+  }
+};
+
+export default function CardPreview({ card, sandbox }) {
+  if (!card) return null;
+  const style = brandStyle(card.card_type || 'visa');
+  const last4 = card.last4 || (card.card_number?.slice(-4)) || '****';
+  return (
+    <div style={{ ...style, borderRadius: 16, padding: 20, width: 320, position: 'relative', fontFamily: 'Inter, sans-serif' }}>
+      {sandbox && (
+        <span style={{ position: 'absolute', top: 8, right: 12, background: '#ffc107', color: '#222', padding: '4px 8px', borderRadius: 6, fontSize: 12 }}>SANDBOX</span>
+      )}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <img src={`/card-brands/${(card.card_type||'visa').toLowerCase()}.svg`} alt={card.card_type} style={{ height: 32 }} onError={(e)=>{e.currentTarget.src='/card-brands/generic.svg';}} />
+        <div style={{ textAlign: 'right', fontSize: 12, opacity:.85 }}>
+          <div>{card.card_status}</div>
+          <div>{card.currency} {Number(card.balance||0).toFixed(2)}</div>
+        </div>
+      </div>
+      <div style={{ marginTop: 28, fontSize: 22, letterSpacing: 2 }}>
+        **** **** **** {last4}
+      </div>
+      <div style={{ marginTop: 20, display: 'flex', justifyContent: 'space-between', fontSize: 13, opacity:.9 }}>
+        <div>
+          <div style={{ fontSize:10, textTransform:'uppercase' }}>Name</div>
+          <div>{card.name_on_card || 'CARD HOLDER'}</div>
+        </div>
+        <div>
+          <div style={{ fontSize:10, textTransform:'uppercase' }}>Expiry</div>
+          <div>{card.expiry || '--/--'}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+Charge utile d’un fetch de détails à stocker dans state:
+```js
+// Exemple structure côté React après un appel /api/strowallet/card-details
+{
+  success: true,
+  response: {
+    card_detail: {
+      card_status: 'active',
+      card_number: 'XXXXXXXXXXXX1234', // si fourni
+      last4: '1234',
+      balance: 50,
+      currency: 'USD',
+      expiry: '12/27',
+      card_type: 'visa',
+      name_on_card: 'John D'
+    }
+  }
+}
+```
+
+XV. Soumission KYC (React + Supabase Storage)
+--------------------------------------------
+Objectif: Permettre à l’utilisateur de téléverser identifiant (pièce) + photo utilisateur avant création du customer.
+
+Flux recommandé:
+1. L’utilisateur remplit formulaire KYC (texte + fichiers).
+2. Les fichiers sont uploadés d’abord dans Supabase Storage (bucket `kyc-assets`).
+3. On récupère les URLs publiques (ou signées) puis on appelle `/api/strowallet/create-customer` en passant `id_image` & `user_photo` (ces clefs côté proxy traduites en `idImage` & `userPhoto`).
+4. Le backend relaie à Strowallet et persiste en base.
+
+Bucket Supabase (à créer): `kyc-assets` (public=false). Générer une URL signée courte durée pour le backend si Strowallet exige accès direct; sinon télécharger et re-post en base64.
+
+React Helper Upload (using Supabase JS):
+```javascript
+// src/lib/uploadKycFile.js
+import { createClient } from '@supabase/supabase-js';
+const supabase = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY);
+
+export async function uploadKycFile(file, userId, type) {
+  const ext = file.name.split('.').pop();
+  const path = `${userId}/${type}-${Date.now()}.${ext}`;
+  const { error } = await supabase.storage.from('kyc-assets').upload(path, file, { upsert: false });
+  if (error) throw error;
+  // Option 1: Public bucket -> get public URL
+  const { data } = supabase.storage.from('kyc-assets').getPublicUrl(path);
+  return data.publicUrl; // si bucket public
+}
+```
+
+Formulaire KYC React: `src/components/StrowalletKycForm.jsx`
+```jsx
+import React, { useState } from 'react';
+import { useStrowallet } from '../hooks/useStrowallet';
+import { uploadKycFile } from '../lib/uploadKycFile';
+
+export default function StrowalletKycForm({ userId }) {
+  const { createCustomer, loading, error } = useStrowallet();
+  const [form, setForm] = useState({
+    first_name: '', last_name: '', customer_email: '', phone: '', date_of_birth: '', address: '', zip_code: ''
+  });
+  const [idFile, setIdFile] = useState(null);
+  const [photoFile, setPhotoFile] = useState(null);
+  const [result, setResult] = useState(null);
+
+  const submit = async e => {
+    e.preventDefault();
+    let id_image_url = null;
+    let user_photo_url = null;
+    if (idFile) id_image_url = await uploadKycFile(idFile, userId, 'id');
+    if (photoFile) user_photo_url = await uploadKycFile(photoFile, userId, 'photo');
+
+    const payload = {
+      ...form,
+      user_id: userId,
+      house_number: form.address.split(' ')[0] || '1',
+      id_image: id_image_url,
+      user_photo: user_photo_url
+    };
+
+    const res = await createCustomer(payload);
+    setResult(res.customer);
+  };
+
+  return (
+    <form onSubmit={submit} style={{ display:'grid', gap:12, maxWidth:420 }}>
+      <input required placeholder='First Name' value={form.first_name} onChange={e=>setForm(f=>({...f, first_name:e.target.value}))} />
+      <input required placeholder='Last Name' value={form.last_name} onChange={e=>setForm(f=>({...f, last_name:e.target.value}))} />
+      <input required type='email' placeholder='Email' value={form.customer_email} onChange={e=>setForm(f=>({...f, customer_email:e.target.value}))} />
+      <input required placeholder='Phone' value={form.phone} onChange={e=>setForm(f=>({...f, phone:e.target.value}))} />
+      <input required placeholder='Date of Birth YYYY-MM-DD' value={form.date_of_birth} onChange={e=>setForm(f=>({...f, date_of_birth:e.target.value}))} />
+      <input required placeholder='Address' value={form.address} onChange={e=>setForm(f=>({...f, address:e.target.value}))} />
+      <input required placeholder='ZIP Code' value={form.zip_code} onChange={e=>setForm(f=>({...f, zip_code:e.target.value}))} />
+      <label> ID Document <input type='file' accept='image/*' onChange={e=>setIdFile(e.target.files[0])} /> </label>
+      <label> User Photo <input type='file' accept='image/*' onChange={e=>setPhotoFile(e.target.files[0])} /> </label>
+      <button disabled={loading}>Submit KYC</button>
+      {error && <p style={{color:'red'}}>{error}</p>}
+      {result && <pre style={{background:'#111',color:'#0f0',padding:12}}>{JSON.stringify(result, null, 2)}</pre>}
+    </form>
+  );
+}
+```
+
+Endpoint backend pour sécuriser (optionnel):
+Au lieu d’upload direct avec clé anonyme, utiliser un endpoint signé qui reçoit FormData -> stocke via service role (évite exposition publique si bucket privé). Exemple minimal Express:
+```javascript
+// server/kycUpload.js
+import express from 'express';
+import multer from 'multer';
+import { createClient } from '@supabase/supabase-js';
+const upload = multer();
+const router = express.Router();
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+router.post('/api/kyc/upload', upload.fields([{ name:'id_image' }, { name:'user_photo' }]), async (req,res)=>{
+  try {
+    const userId = req.body.user_id;
+    const out = {};
+    for (const field of ['id_image','user_photo']) {
+      if (req.files[field]?.[0]) {
+        const f = req.files[field][0];
+        const path = `${userId}/${field}-${Date.now()}.jpg`;
+        const { error } = await supabase.storage.from('kyc-assets').upload(path, f.buffer, { contentType: f.mimetype });
+        if (error) throw error;
+        const { data } = supabase.storage.from('kyc-assets').getPublicUrl(path); // si public
+        out[field] = data.publicUrl;
+      }
+    }
+    res.json({ success:true, ...out });
+  } catch(e) {
+    res.status(400).json({ success:false, message:e.message });
+  }
+});
+export default router;
+```
+
+Sécurité & Conformité:
+- Ne jamais stocker en clair des documents sensibles accessibles publiquement si réglementation stricte (GDPR, etc.). Privilégier bucket privé + URL signées courtes.
+- Valider formats d’image (JPEG/PNG), taille max (ex: 2MB) et exécuter un antivirus si requis.
+- Journaliser l’empreinte SHA256 des fichiers pour traçabilité.
+
+XVI. Points à Vérifier Avant Production
+--------------------------------------
+1. Politique de rétention des documents KYC (durée, purge automatique).
+2. Gestion des erreurs Strowallet: codes spécifiques, re-tentatives côté serveur (ex: 429, 5xx).
+3. Mise en place monitoring webhook: taux de réussite, duplications ignorées.
+4. Table index supplémentaire: `create index on strowallet_cards(status);` si nombreuses requêtes filtrées.
+5. Ajout d’un mapping user_id par card_id dans webhook pour rattacher automatiquement events (lookup Supabase select sur card_id avant insert).
+6. Ajout test d’intégrité: comparer balance locale vs balance remote périodiquement.
+

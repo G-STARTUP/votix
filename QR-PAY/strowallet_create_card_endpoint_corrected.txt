@@ -1,0 +1,130 @@
+Strowallet – Endpoint de Création de Carte (Corrigé)
+====================================================
+
+Objectif
+--------
+Ce document fournit les détails techniques corrigés pour l'endpoint de création de carte (`create-card`), en incluant le paramètre `currency` manquant et le prérequis de financement du compte.
+
+---
+
+### Endpoint : Création de Carte
+
+*   **URL :** `https://strowallet.com/api/create-card/`
+*   **Méthode :** `POST`
+*   **Description :** Crée une nouvelle carte virtuelle pour un client existant, identifié par son `customerEmail`.
+
+---
+
+### **Important Prérequis : Financer Votre Compte Principal**
+
+L'erreur `Solde insuffisant` (`Insufficient balance`) signifie que votre compte principal Strowallet (associé à votre `public_key`) n'a pas assez de fonds pour couvrir le montant initial de la carte (`amount`) plus les frais de création.
+
+**Action requise :** Avant d'appeler cet endpoint, vous devez vous assurer que votre portefeuille principal Strowallet est suffisamment approvisionné. Connectez-vous à votre dashboard Strowallet pour y ajouter des fonds. Le solde disponible doit être supérieur ou égal au montant de la carte + les frais.
+
+---
+
+### Payload Complet et Corrigé
+
+Voici le corps de la requête (payload) que votre serveur doit envoyer à Strowallet. Le champ `currency` est obligatoire.
+
+```json
+{
+  "public_key": "pk_live_xxx",
+  "name_on_card": "John Doe",
+  "card_type": "visa",
+  "amount": 25.00,
+  "currency": "USD", 
+  "customerEmail": "john.doe@example.com",
+  "developer_code": "appdevsx"
+}
+```
+
+**Champs détaillés :**
+
+| Champ           | Type   | Obligatoire | Description                                                                 |
+| --------------- | ------ | ----------- | --------------------------------------------------------------------------- |
+| `public_key`    | String | Oui         | Votre clé publique de production fournie par Strowallet.                    |
+| `name_on_card`  | String | Oui         | Le nom complet qui sera affiché sur la carte virtuelle.                     |
+| `card_type`     | String | Oui         | Le type de carte. Généralement `"visa"` ou `"mastercard"`.                  |
+| `amount`        | Number | Oui         | Le montant initial à charger sur la carte lors de sa création.              |
+| `currency`      | String | **Oui**     | **Le code de la devise (ex: "USD", "NGN", "GHS"). Son absence cause une erreur 500.** |
+| `customerEmail` | String | Oui         | L'email du client Strowallet (créé via l'étape KYC) à qui la carte sera liée. |
+| `developer_code`| String | Non         | Un code spécifique au développeur, si fourni par Strowallet.                |
+
+---
+
+### Réponses Attendues
+
+#### 1. Réponse en cas de Succès
+
+Si le payload est correct (avec la devise), Strowallet répondra avec un **code HTTP 200 (OK)** et les détails de la carte.
+
+```json
+{
+  "success": true,
+
+### Format Réel Observé des Identifiants / Clés
+
+Pour éviter toute confusion, voici un récapitulatif sur les formats constatés ou attendus. Tu as indiqué que la valeur affichée sur ton dashboard est :
+
+```
+1JA6RG3ED5XPKPJQ7B2W54QHOJJGKV
+```
+
+Cette chaîne :
+- Longueur: 31 caractères.
+- Charset: uniquement lettres majuscules (A–Z) et chiffres (0–9) (alphanumérique upper-case).
+- Absence de préfixe type `pk_live_` ou `pk_test_`.
+
+Interprétation probable:
+1. Strowallet expose une « clé publique » simplifiée (un identifiant API public) sans préfixe.
+2. Le préfixe `pk_live_xxx` utilisé dans les exemples précédents est un placeholder pédagogique (format générique de nombreux PSP) mais ne reflète pas exactement leur implémentation actuelle.
+
+Comment valider que c’est bien la clé à utiliser dans `public_key`:
+1. Appeler un endpoint lecture ne modifiant rien, par ex. le solde: `GET https://strowallet.com/api/wallet/balance/USD/?public_key=LA_CHAINE`. (Remplacer USD par une devise supportée.)
+2. Si la réponse retourne 401 / clé invalide, contacter le support pour confirmer si un autre identifiant (avec préfixe) existe.
+3. Si la réponse retourne un JSON avec `success: true` ou un objet balance, tu peux l’utiliser telle quelle dans `public_key`.
+
+Bonnes pratiques stockage:
+- Mettre la valeur dans une variable d’environnement: `STROWALLET_PUBLIC_KEY=1JA6RG3ED5XPKPJQ7B2W54QHOJJGKV`
+- Ne pas commit la clé en clair dans le code source front (utiliser un proxy backend ou edge function sécurisée).
+
+Autres identifiants (rappel):
+- `card_id`: renvoyé par `create-card` (ex: `card_ab12cd34ef56`).
+- `customerId`: renvoyé lors de la création / récupération client (ex: `cust_x9a7ef12`).
+- `last4`: 4 derniers digits de la carte, jamais le PAN complet (protection PCI).
+
+Si Strowallet te fournit à terme des clés préfixées (`pk_live_`, `pk_test_`), tu pourras mettre à jour cette section. En attendant, utilise ce format uppercase alphanumérique directement.
+
+  "response": {
+    "card_id": "card_987654321",
+    "card_status": "active",
+    "card_type": "visa",
+    "name_on_card": "John Doe",
+    "last4": "1234",
+    "balance": 25.00,
+    "currency": "USD",
+    "expiry": "12/27"
+  },
+  "message": "Card created"
+}
+```
+
+#### 2. Réponse en cas d'Erreur (Problème initial)
+
+Si le champ `currency` est manquant dans le payload, l'API de Strowallet retourne une **erreur serveur HTTP 500**, car elle ne peut pas traiter la demande sans savoir dans quelle devise créer la carte. La réponse peut être vide ou contenir un message d'erreur générique.
+
+**Exemple de réponse d'erreur (si le champ `customerEmail` est introuvable) :**
+
+```json
+{
+  "success": false,
+  "message": "Customer with this email not found."
+}
+```
+
+---
+
+### Résumé de la Correction
+
+Le problème était que le payload envoyé à l'API `create-card` ne contenait pas le champ `currency`. En l'ajoutant, l'erreur 500 devrait être résolue et la création de carte devrait fonctionner correctement.

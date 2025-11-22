@@ -1,0 +1,261 @@
+Gestion Complète des Cartes Strowallet
+=====================================
+
+Objectif
+--------
+Fournir une synthèse opérationnelle et technique exhaustive pour la gestion des cartes virtuelles Strowallet dans l'écosystème (Laravel existant et cible React + Supabase). Inclut cycle de vie, endpoints, sécurité, stockage, audits, monitoring, tests et migration.
+
+Table des Matières
+------------------
+1. Vue d'ensemble du Cycle de Vie
+2. États & Transitions de Carte
+3. Endpoints Laravel Actuels (Référence)
+4. Endpoints Proxy/Backend Proposés (Node/Express ou Edge Functions)
+5. Modèle de Données (Base + Index)
+6. Sécurité & Conformité (Données sensibles)
+7. Webhooks & Événements liés aux Cartes
+8. Performance & Caching
+9. Stratégie de Réconciliation & Intégrité
+10. Journalisation & Audit
+11. Alerting & Monitoring
+12. Flux de Migration depuis Laravel
+13. Tests (Unitaires, Intégration, E2E)
+14. Stratégie d'Erreur & Retentatives
+15. Checklist Pré-Déploiement
+16. Plan d'Évolution Future
+
+1. Vue d'ensemble du Cycle de Vie
+---------------------------------
+Étapes typiques:
+1. KYC utilisateur (création customer Strowallet).
+2. Création de carte virtuelle (via endpoint create-card).
+3. Stockage des métadonnées (card_id, last4, statut, solde initial, currency).
+4. Consultation détail carte (fetch-card-detail) pour affichage / synchronisation.
+5. Opérations: funding (si endpoint de recharge), blocage / déblocage, mise à jour statut.
+6. Transactions (débits/crédits) via webhooks ou polling.
+7. Clôture / désactivation carte (suivant règles du fournisseur).
+
+2. États & Transitions de Carte
+-------------------------------
+États possibles (exemples): `active`, `inactive`, `blocked`, `terminated`, `pending_activation`, `failed`.
+Transitions:
+- `pending_activation -> active` après confirmation fournisseur.
+- `active -> blocked` (action manuelle ou fraude détectée).
+- `blocked -> active` (déblocage autorisé).
+- `active -> terminated` (expiration ou clôture définitive).
+Règles:
+- Une carte `terminated` n'est jamais réactivée (créer nouvelle).
+- Toute opération financière interdite si `blocked` ou `inactive`.
+
+3. Endpoints Laravel Actuels (Référence)
+----------------------------------------
+Routes utilisateur (extraits):
+- POST `.../create` (achat/création carte)
+- GET `.../details/{card_id}`
+- GET `.../transaction/{card_id}`
+- GET `.../webhook/transaction/{card_id}`
+- POST `.../webhook` (ingestion sans signature) -> À sécuriser.
+Routes API (extraits):
+- POST `/api/strowallet-card/create`
+- GET `/api/strowallet-card/details`
+- GET `/api/strowallet-card/transaction`
+- POST `/api/strowallet-card/block` / `/unblock`
+Helper clé: `create_strowallet_virtual_card`, `card_details`, `updateStroWalletCardBalance`.
+
+4. Endpoints Proxy/Backend Proposés (Node/Express)
+--------------------------------------------------
+Base prefix: `/api/strowallet/`
+- POST `create-customer` -> KYC + création utilisateur.
+- POST `create-card` -> Création carte (payload: name_on_card, amount, customerEmail, mode).
+- GET `card-details?card_id=...` -> Détails carte pour UI.
+- GET `balance?currency=USD` -> Solde wallet fournisseur.
+- POST `fund-card` (si supporté) -> Recharger carte (amount, card_id).
+- POST `block-card` -> Mettre statut `blocked`.
+- POST `unblock-card` -> Restaurer `active`.
+- GET `list-cards?user_id=...` -> Pagination/filtrage.
+- POST `/webhooks/strowallet` -> Ingestion sécurisée (HMAC + idempotence).
+
+5. Modèle de Données (Supabase / SQL)
+------------------------------------
+Table `strowallet_cards` (champs):
+- `id` (uuid PK)
+- `user_id` (uuid) -> référence utilisateur
+- `card_id` (text unique)
+- `name_on_card` (text)
+- `card_type` (text) ex: visa
+- `status` (text) indexé
+- `balance` (numeric)
+- `currency` (text)
+- `expiry` (text MM/YY)
+- `last4` (text)
+- `cvv` (text) -> idéal: ne pas stocker, sinon chiffrement serveur
+- `raw_response` (jsonb) snapshot initial création
+- timestamps
+Index:
+```sql
+create unique index if not exists strowallet_cards_card_id_idx on strowallet_cards(card_id);
+create index if not exists strowallet_cards_status_idx on strowallet_cards(status);
+create index if not exists strowallet_cards_user_idx on strowallet_cards(user_id);
+```
+
+6. Sécurité & Conformité
+------------------------
+- Masquage numéro: stocker seulement `last4` + éventuellement token de référence; jamais full PAN en clair.
+- CVV: éviter stockage (récupération just-in-time si API supporte, sinon laisser vide).
+- Chiffrement: si obligations, utiliser libs côté serveur (ex: AES-256-GCM) pour champs sensibles.
+- Webhook: HMAC SHA256 sur corps brut + `X-Strowallet-Timestamp`.
+- Prévention de relecture: idempotence via `event_id` unique.
+- Logs: purger données sensibles (PAN complet, CVV).
+- KYC: bucket privé, durée rétention définie (ex: 5 ans ou régulation locale).
+
+7. Webhooks & Événements liés aux Cartes
+----------------------------------------
+Événements potentiels:
+- `card.created`
+- `card.blocked`
+- `card.unblocked`
+- `card.funded`
+- `transaction.posted`
+- `balance.updated`
+Stockage table `strowallet_webhook_events` (event_id, card_id, event_type, payload, signature_valid, inserted_at).
+Traitement:
+1. Vérifier signature.
+2. Vérifier idempotence.
+3. Mapper `card_id -> user_id` via table des cartes.
+4. Mettre à jour `strowallet_cards.balance` si payload contient balance.
+5. Enquêter divergences (voir section 9).
+
+8. Performance & Caching
+------------------------
+- Cache mémoire (ex: Redis) pour détails carte fréquemment consultés (clé `card:{card_id}` TTL 5 min).
+- Pré-chargement après webhook `balance.updated`.
+- Pagination: limiter `list-cards` (page, size, order by created_at DESC).
+- Minimiser `raw_response` taille en nettoyant champs non critiques.
+
+9. Stratégie de Réconciliation & Intégrité
+------------------------------------------
+Tâche cron (ex: chaque nuit):
+1. Parcourir cartes actives.
+2. Appeler fournisseur `fetch-card-detail`.
+3. Comparer solde local vs remote; journaliser mismatch.
+4. Corriger mismatch (optionnel) en mettant à jour table locale.
+Rapport d'intégrité: nombre de divergences, cartes bloquées, anomalies.
+
+10. Journalisation & Audit
+-------------------------
+Log structuré (JSON):
+- Catégories: `card_lifecycle`, `webhook_ingest`, `balance_reconcile`, `security`.
+- Champs minimaux: timestamp, level, event_type, card_id, user_id, diff_before_after (si changement), correlation_id.
+Audit Trail:
+- Table dédiée `strowallet_card_audit` (id, card_id, action, actor_type(user/system), actor_id, diff, created_at).
+
+11. Alerting & Monitoring
+-------------------------
+- Threshold mismatch solde > X% -> alerte.
+- Taux d'échec webhooks (>5% dernière heure) -> alerte.
+- Nombre cartes bloquées > baseline + sigma -> alerte fraude.
+- Latence API externe > 2s moyenne 5 min -> alerte performance.
+Outils: Prometheus (metrics exposées), Grafana (dashboards), Loki (logs).
+
+12. Flux de Migration depuis Laravel
+------------------------------------
+1. Export table `strowallet_virtual_card` -> CSV (card_id, user_id, balance, status, currency, expiry, last4).
+2. Import vers Supabase `strowallet_cards` (mapper colonnes).
+3. Export Webhook historique -> insérer dans `strowallet_webhook_events` (marquer `signature_valid=false` pour ancien).
+4. Vérifier cohérence utilisateurs (user_id mapping stable).
+5. Geler anciennes routes Laravel ou rediriger vers nouveau proxy.
+
+13. Tests
+--------
+Unitaires (Jest / PHPUnit):
+- Fonction de masque numéro.
+- Génération signature HMAC (valeur attendue).
+Intégration:
+- Création carte -> insertion DB.
+- Webhook ingest valide -> update solde.
+- Webhook duplicate -> pas de double insertion.
+E2E (Playwright/Cypress):
+- Form KYC + création carte -> affichage UI.
+- Blocage carte -> UI montre statut mis à jour.
+- Reconciliation job -> detecte mismatch simulé.
+Tests de charge:
+- 1000 requêtes `card-details` concurrentes -> vérifier TTL cache.
+
+14. Stratégie d'Erreur & Retentatives
+------------------------------------
+Types d'erreurs:
+- Réseau (timeout, DNS): retry exponentiel (max 3).
+- Fournisseur 5xx: retry avec jitter.
+- 4xx (validation): ne pas retry; log + retour message clair.
+- Signature webhook invalide: log security niveau WARN + métrique compteur.
+Structure retour JSON standard:
+```json
+{ "success": false, "error_code": "CARD_NOT_FOUND", "message": "Carte introuvable" }
+```
+
+15. Checklist Pré-Déploiement
+-----------------------------
+[ ] Variables env définies (public_key, secret_key, base_url, mode, webhook_secret).
+[ ] Index DB créés.
+[ ] Stockage KYC sécurisé (bucket privé + TTL purge).
+[ ] Monitoring & alerting configurés.
+[ ] Tests unitaires & intégration verts (>80% couverture logique critique).
+[ ] Politique purge logs sensible (> 90 jours max pour PAN partiels).
+[ ] Reconciliation job planifié.
+[ ] Documentation opérationnelle accessible (runbook incident).
+
+16. Plan d'Évolution Future
+---------------------------
+- Tokenisation interne des cartes (mapper alias local -> card_id réel).
+- Support multi-fournisseur (abstraction interface `CardProvider`).
+- Ajout d'un moteur de règles fraude (score comportemental, vitesse transactions).
+- Chiffrement champ `last4` + rotation clés (option réglementaire haute sécurité).
+- Table métriques agrégées (journalière: volume transactions, funding total, cartes actives).
+- Intégration système interne de notifications (email/webhook sur blocage).
+
+Annexe A – Exemple Endpoint Block/Unblock (Express)
+--------------------------------------------------
+```javascript
+app.post('/api/strowallet/block-card', async (req,res)=>{
+  try {
+    const { card_id } = req.body;
+    // Appel fournisseur si API supporte, sinon statut local
+    await supabase.from('strowallet_cards').update({ status: 'blocked' }).eq('card_id', card_id);
+    res.json({ success:true, card_id, status:'blocked' });
+  } catch(e) { res.status(400).json({ success:false, message:e.message }); }
+});
+
+app.post('/api/strowallet/unblock-card', async (req,res)=>{
+  try {
+    const { card_id } = req.body;
+    await supabase.from('strowallet_cards').update({ status: 'active' }).eq('card_id', card_id);
+    res.json({ success:true, card_id, status:'active' });
+  } catch(e) { res.status(400).json({ success:false, message:e.message }); }
+});
+```
+
+Annexe B – Masquage Numéro (Utilitaire)
+--------------------------------------
+```javascript
+export function maskPan(fullPan, last4){
+  if (last4) return '**** **** **** ' + last4;
+  if (!fullPan || fullPan.length < 4) return '**** **** **** ****';
+  return '**** **** **** ' + fullPan.slice(-4);
+}
+```
+
+Annexe C – Signature Webhook (Node)
+-----------------------------------
+```javascript
+import crypto from 'crypto';
+export function verifySignature(rawBody, timestamp, signature, secret){
+  const drift = Math.abs(Date.now() - Number(timestamp));
+  if (drift > 5*60*1000) return false;
+  const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(signature,'hex'), Buffer.from(expected,'hex'));
+  } catch { return false; }
+}
+```
+
+Fin du document.

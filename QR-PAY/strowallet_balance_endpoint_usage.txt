@@ -1,0 +1,126 @@
+Strowallet – Endpoint Balance (Guide Complet GET)
+===============================================
+
+Objectif
+--------
+Clarifier l'usage correct de l'endpoint de solde Strowallet, suite aux erreurs 405 rencontrées (méthode POST utilisée au lieu de GET). Fournir exemples, Edge Function, diagnostics et bonnes pratiques.
+
+Endpoint
+--------
+Pattern:
+GET https://strowallet.com/api/wallet/balance/{CURRENCY}/?public_key={PUBLIC_KEY}
+
+Exemple (production):
+GET https://strowallet.com/api/wallet/balance/USD/?public_key=1JA6RG3ED5XPKPJQ7B2W54QHOJJGKV
+
+Méthode HTTP
+------------
+Uniquement GET (HEAD possible mais sans corps). Toute tentative en POST retourne:
+HTTP 405
+Message: The POST method is not supported for this route. Supported methods: GET, HEAD.
+
+Paramètres
+----------
+| Paramètre    | Type   | Obligatoire | Description |
+|--------------|--------|-------------|-------------|
+| CURRENCY     | String | Oui         | Code devise supportée (ex: USD). |
+| public_key   | String | Oui         | Clé publique fournie par Strowallet (uppercase alphanumérique). |
+
+Headers recommandés:
+Accept: application/json
+(Authorization non requis pour cet endpoint selon code existant)
+
+Exemple curl
+------------
+```bash
+curl -s -H "Accept: application/json" "https://strowallet.com/api/wallet/balance/USD/?public_key=1JA6RG3ED5XPKPJQ7B2W54QHOJJGKV"
+```
+Réponse succès attendue (structure simplifiée):
+```json
+{ "balance": 1250.75 }
+```
+Réponse erreur possible:
+```json
+{ "message": "Invalid public key" }
+```
+Ou absence de clé `balance` → traiter comme erreur.
+
+Exemple Edge Function Supabase (corrigé)
+---------------------------------------
+```ts
+import { serve } from "https://deno.land/std/http/server.ts";
+import { STROWALLET_PUBLIC_KEY, STROWALLET_BASE_URL } from "../_shared/env.ts";
+
+serve(async () => {
+  try {
+    const currency = "USD"; // TODO: rendre dynamique si besoin
+    const url = `${STROWALLET_BASE_URL}wallet/balance/${currency}/?public_key=${encodeURIComponent(STROWALLET_PUBLIC_KEY)}`;
+    const resp = await fetch(url, { headers:{ "accept":"application/json" } });
+    const data = await resp.json();
+    if (data.balance !== undefined) {
+      return new Response(JSON.stringify({ success:true, balance:data.balance, currency }), { status:200 });
+    }
+    return new Response(JSON.stringify({ success:false, message:data.message||"Balance fetch failed" }), { status:400 });
+  } catch (e) {
+    return new Response(JSON.stringify({ success:false, message:e.message }), { status:500 });
+  }
+});
+```
+
+Intégration React (fetch interne)
+---------------------------------
+```ts
+async function getStrowalletBalance(){
+  const r = await fetch('/functions/v1/strowallet-balance');
+  const json = await r.json();
+  if(!json.success) throw new Error(json.message||'Unable to fetch balance');
+  return json.balance;
+}
+```
+
+Erreurs Fréquentes & Diagnostic
+-------------------------------
+| Symptom | Cause Probable | Action |
+|---------|----------------|-------|
+| HTTP 405 | Utilisation POST | Changer vers GET. |
+| HTTP 400 / message clé invalide | Mauvaise clé publique | Vérifier clé exacte du dashboard (aucun préfixe pk_live_). |
+| Réponse sans `balance` | Devise non supportée ou erreur backend | Tester avec USD, inspecter `message`. |
+| Timeout | Problème réseau / latence | Ajouter timeout fetch, tester via curl. |
+
+Checklist Validation
+--------------------
+- [ ] Méthode GET vérifiée via curl.
+- [ ] Clé publique copiée sans espace caché.
+- [ ] Devise testée: USD OK.
+- [ ] Gestion erreur absence de `balance` implémentée.
+- [ ] Edge Function déployée et protégée (auth si nécessaire).
+
+Bonnes Pratiques
+----------------
+1. Cacher la clé publique côté Edge Function (ne pas injecter dans front directement).
+2. Mettre en cache la réponse (ex: 30–60s) pour éviter surcharge.
+3. Journaliser échecs répétés (3+ erreurs consécutives → alerte).
+4. Ne pas extrapoler le solde pour des calculs critiques sans confirmation (rafraîchir avant opérations sensibles).
+
+Exemple Cache Rapide (pseudo-code Deno)
+--------------------------------------
+```ts
+let lastCache: { ts:number; balance:number|null } = { ts:0, balance:null };
+const TTL = 60000;
+// Dans la fonction:
+if(Date.now() - lastCache.ts < TTL && lastCache.balance !== null){
+  return new Response(JSON.stringify({ success:true, balance:lastCache.balance, cached:true }), { status:200 });
+}
+// Sinon faire le fetch puis stocker
+lastCache = { ts: Date.now(), balance: data.balance ?? null };
+```
+
+Sécurité / Limitations
+----------------------
+- Endpoint ne demande pas la secret key: ne pas tenter POST avec credentials inutiles.
+- Ajouter rate limiting côté Edge pour éviter abus (ex: 30 req/min/utilisateur).
+- Si Strowallet change la signature des réponses, adapter parse (ne jamais supposer `balance`).
+
+Résumé
+------
+L’échec 405 provient de l’usage POST incorrect. Utiliser strictement GET sur l’URL de balance avec la `public_key`. Implémenter Edge Function proxy, validation, cache, et affichage sécurisé. Ce document sert de référence dédiée pour éviter les erreurs de méthode.

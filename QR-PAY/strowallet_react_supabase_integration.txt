@@ -1,0 +1,368 @@
+Intégration Strowallet – Guide React + Supabase Complet
+=====================================================
+
+Objectif
+--------
+Fournir une implémentation de référence pour intégrer l'API Strowallet (création client KYC, création carte virtuelle, récupération détails, solde compte, webhooks) dans une stack moderne React + Supabase (Postgres + Storage + Edge Functions). Basé sur l'analyse du code PHP existant et sur les corrections documentées (champ `currency` obligatoire).
+
+Architecture Résumée
+--------------------
+1. React Frontend: Formulaires (KYC, création carte), affichage cartes, état.
+2. Supabase Postgres: Stocker les métadonnées clients/cartes/webhooks (jamais le PAN complet ni CVV).
+3. Supabase Storage: Stockage fichiers KYC (idImage, userPhoto).
+4. Supabase Edge Functions (Deno): Proxy sécurisé des endpoints Strowallet.
+5. Sécurité: Variables d'environnement (clé publique), RLS sur tables, vérification anti double-soumission, logs d'audit.
+
+Tables SQL (Propositions)
+-------------------------
+Exécuter via Supabase SQL Editor.
+```sql
+-- Table clients Strowallet
+create table public.strowallet_customers (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  customer_email text not null unique,
+  customer_id text, -- si Strowallet retourne un identifiant distinct
+  status text default 'pending', -- low_kyc | under_review | high_kyc
+  first_name text,
+  last_name text,
+  country text,
+  city text,
+  state text,
+  zip_code text,
+  date_of_birth date,
+  id_type text,
+  id_image_url text,
+  user_photo_url text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+-- Table cartes virtuelles
+create table public.strowallet_cards (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  customer_email text not null references public.strowallet_customers(customer_email) on delete cascade,
+  card_id text not null unique,
+  name_on_card text not null,
+  card_type text not null,
+  card_brand text,
+  last4 text,
+  expiry text,
+  currency text not null,
+  balance numeric(18,2) default 0,
+  card_status text not null,
+  reference text,
+  card_user_id text,
+  is_default boolean default false,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+-- Table webhooks (traçabilité transactions / changements)
+create table public.strowallet_webhooks (
+  id bigserial primary key,
+  event_type text,
+  card_id text,
+  raw_payload jsonb not null,
+  signature text,
+  received_at timestamptz default now()
+);
+
+-- Audit simplifié (optionnel)
+create table public.strowallet_audit (
+  id bigserial primary key,
+  actor_user uuid references auth.users(id),
+  action text not null,
+  ref_id text,
+  meta jsonb,
+  created_at timestamptz default now()
+);
+```
+
+RLS (Row Level Security) – Exemples
+-----------------------------------
+Activer RLS:
+```sql
+alter table public.strowallet_customers enable row level security;
+alter table public.strowallet_cards enable row level security;
+```
+Politiques:
+```sql
+create policy "customers select own" on public.strowallet_customers for select using ( auth.uid() = user_id );
+create policy "customers insert self" on public.strowallet_customers for insert with check ( auth.uid() = user_id );
+create policy "cards select own" on public.strowallet_cards for select using ( auth.uid() = user_id );
+create policy "cards insert self" on public.strowallet_cards for insert with check ( auth.uid() = user_id );
+create policy "cards update own" on public.strowallet_cards for update using ( auth.uid() = user_id );
+```
+
+Storage (Bucket KYC)
+--------------------
+Créer bucket `strowallet-kyc` (public = false). Fichiers:
+- `id-images/{user_id}-{timestamp}.jpg`
+- `user-photos/{user_id}-{timestamp}.jpg`
+Stocker seulement les URLs dans la table clients.
+
+Variables d'Environnement (Supabase Edge)
+----------------------------------------
+Dans `supabase/functions/_shared/env.ts` (exemple Deno):
+```ts
+export const STROWALLET_PUBLIC_KEY = Deno.env.get('STROWALLET_PUBLIC_KEY')!; // ex: 1JA6RG3ED5XPKPJQ7B2W54QHOJJGKV
+export const STROWALLET_BASE_URL = Deno.env.get('STROWALLET_BASE_URL') || 'https://strowallet.com/api/';
+export const STROWALLET_MODE = Deno.env.get('STROWALLET_MODE') || 'live'; // 'sandbox' si tests
+```
+
+Edge Function: Création Client
+------------------------------
+`supabase/functions/create-strowallet-customer/index.ts`
+```ts
+// deno-lint-ignore-file no-explicit-any
+import { serve } from "https://deno.land/std/http/server.ts";
+import { STROWALLET_PUBLIC_KEY, STROWALLET_BASE_URL, STROWALLET_MODE } from "../_shared/env.ts";
+
+serve(async (req) => {
+  try {
+    const body = await req.json();
+    const { customerEmail, firstName, lastName, dateOfBirth, phoneNumber, address, zipCode, idImageUrl, userPhotoUrl } = body;
+    for(const f of [customerEmail, firstName, lastName]){
+      if(!f) return new Response(JSON.stringify({ success:false, message:'Missing required fields'}), { status:400 });
+    }
+    const form = {
+      public_key: STROWALLET_PUBLIC_KEY,
+      houseNumber: '1',
+      firstName,
+      lastName,
+      idNumber: Math.floor(Math.random()*1e9).toString(),
+      customerEmail,
+      phoneNumber: phoneNumber || '',
+      dateOfBirth,
+      idImage: idImageUrl || '',
+      userPhoto: userPhotoUrl || '',
+      line1: address,
+      state: 'Accra',
+      zipCode,
+      city: 'Accra',
+      country: 'Ghana',
+      idType: 'PASSPORT'
+    };
+    const resp = await fetch(STROWALLET_BASE_URL+'create-user/', {
+      method:'POST', headers:{ 'accept':'application/json' }, body: new URLSearchParams(form)
+    });
+    const data = await resp.json();
+    return new Response(JSON.stringify(data), { status: resp.status });
+  } catch(e){
+    return new Response(JSON.stringify({ success:false, message:'Internal error', detail:e.message }), { status:500 });
+  }
+});
+```
+
+Edge Function: Création Carte
+-----------------------------
+`supabase/functions/create-strowallet-card/index.ts`
+```ts
+import { serve } from "https://deno.land/std/http/server.ts";
+import { STROWALLET_PUBLIC_KEY, STROWALLET_BASE_URL, STROWALLET_MODE } from "../_shared/env.ts";
+
+serve(async (req) => {
+  try {
+    const b = await req.json();
+    const { name_on_card, amount, currency, customerEmail } = b;
+    if(!name_on_card || !amount || !currency || !customerEmail){
+      return new Response(JSON.stringify({ success:false, message:'Missing required fields'}), { status:400 });
+    }
+    const payload: Record<string,any> = {
+      public_key: STROWALLET_PUBLIC_KEY,
+      name_on_card,
+      card_type: 'visa',
+      amount: Number(amount),
+      currency,
+      customerEmail,
+      developer_code: 'appdevsx'
+    };
+    if(STROWALLET_MODE === 'sandbox') payload.mode = 'sandbox';
+
+    const resp = await fetch(STROWALLET_BASE_URL+'create-card/', {
+      method:'POST', headers:{ 'accept':'application/json', 'content-type':'application/json' }, body: JSON.stringify(payload)
+    });
+    const data = await resp.json();
+    return new Response(JSON.stringify(data), { status: resp.status });
+  } catch(e){
+    return new Response(JSON.stringify({ success:false, message:'Internal error', detail:e.message }), { status:500 });
+  }
+});
+```
+
+Edge Function: Détails Carte
+----------------------------
+```ts
+import { serve } from "https://deno.land/std/http/server.ts";
+import { STROWALLET_PUBLIC_KEY, STROWALLET_BASE_URL, STROWALLET_MODE } from "../_shared/env.ts";
+serve(async (req) => {
+  try {
+    const { card_id } = await req.json();
+    if(!card_id) return new Response(JSON.stringify({ success:false, message:'card_id required'}), { status:400 });
+    const payload: any = { public_key: STROWALLET_PUBLIC_KEY, card_id };
+    if(STROWALLET_MODE === 'sandbox') payload.mode = 'sandbox';
+    const resp = await fetch(STROWALLET_BASE_URL+'fetch-card-detail/', { method:'POST', headers:{'accept':'application/json','content-type':'application/json'}, body: JSON.stringify(payload)});
+    const data = await resp.json();
+    return new Response(JSON.stringify(data), { status: resp.status });
+  }catch(e){
+    return new Response(JSON.stringify({ success:false, message:'Internal error', detail:e.message }), { status:500 });
+  }
+});
+```
+
+Edge Function: Solde Compte
+--------------------------
+```ts
+import { serve } from "https://deno.land/std/http/server.ts";
+import { STROWALLET_PUBLIC_KEY, STROWALLET_BASE_URL } from "../_shared/env.ts";
+serve(async (req) => {
+  try {
+    const url = STROWALLET_BASE_URL+`wallet/balance/USD/?public_key=${encodeURIComponent(STROWALLET_PUBLIC_KEY)}`;
+    const resp = await fetch(url, { headers:{ 'accept':'application/json' }});
+    const data = await resp.json();
+    if(data.balance !== undefined) return new Response(JSON.stringify({ status:true, balance:data.balance }), { status:200 });
+    return new Response(JSON.stringify({ status:false, message:data.message||'Unable to fetch balance'}), { status:400 });
+  }catch(e){ return new Response(JSON.stringify({ status:false, message:e.message }), { status:500 }); }
+});
+```
+
+Edge Function: Webhook Receiver (Esquisse)
+-----------------------------------------
+```ts
+import { serve } from "https://deno.land/std/http/server.ts";
+serve(async (req) => {
+  try {
+    const payload = await req.json();
+    // TODO: vérifier signature si Strowallet en fournit une.
+    // Stocker dans strowallet_webhooks via RPC (ou PostgREST directement).
+    // Exemple minimal
+    // await fetch(`${Deno.env.get('SUPABASE_URL')}/rest/v1/strowallet_webhooks`, { method:'POST', headers:{ 'apikey': Deno.env.get('SUPABASE_SERVICE_ROLE')!, 'Content-Type':'application/json' }, body: JSON.stringify({ event_type: payload.type||'unknown', card_id: payload.card_id, raw_payload: payload }) });
+    return new Response(JSON.stringify({ received:true }), { status:200 });
+  } catch(e){
+    return new Response(JSON.stringify({ received:false, error:e.message }), { status:500 });
+  }
+});
+```
+
+Hooks React – useStrowallet
+---------------------------
+```ts
+// src/hooks/useStrowallet.ts
+import { useState, useCallback } from 'react';
+
+interface CardResp { card_id:string; card_status:string; last4?:string; balance?:number; currency?:string; expiry?:string; }
+
+export function useStrowallet(){
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string|null>(null);
+
+  const createCard = useCallback(async (input:{ name_on_card:string; amount:number; currency:string; customerEmail:string }) => {
+    setLoading(true); setError(null);
+    try {
+      const r = await fetch('/functions/v1/create-strowallet-card', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(input)});
+      const data = await r.json();
+      if(!data.success) throw new Error(data.message||data.error||'Card creation failed');
+      return data.response as CardResp;
+    } catch(e:any){ setError(e.message); throw e; } finally { setLoading(false); }
+  }, []);
+
+  const fetchDetails = useCallback(async (card_id:string) => {
+    setLoading(true); setError(null);
+    try {
+      const r = await fetch('/functions/v1/fetch-strowallet-card-detail', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ card_id }) });
+      const data = await r.json();
+      if(!data.success) throw new Error(data.message||'Fetch failed');
+      return data.response.card_detail as CardResp;
+    } catch(e:any){ setError(e.message); throw e; } finally { setLoading(false); }
+  }, []);
+
+  return { createCard, fetchDetails, loading, error };
+}
+```
+
+Formulaire React – Création Carte
+---------------------------------
+```tsx
+import React, { useState } from 'react';
+import { useStrowallet } from '../hooks/useStrowallet';
+
+export function CardCreateForm({ customerEmail }:{ customerEmail:string }){
+  const { createCard, loading, error } = useStrowallet();
+  const [name, setName] = useState('');
+  const [amount, setAmount] = useState(25);
+  const [currency, setCurrency] = useState('USD');
+
+  async function onSubmit(e:React.FormEvent){
+    e.preventDefault();
+    try {
+      await createCard({ name_on_card: name, amount, currency, customerEmail });
+      // TODO: refresh list
+    } catch(_){}
+  }
+
+  return (
+    <form onSubmit={onSubmit}>
+      <input value={name} onChange={e=>setName(e.target.value)} placeholder='Name on card' required />
+      <input type='number' value={amount} min={1} onChange={e=>setAmount(Number(e.target.value))} required />
+      <select value={currency} onChange={e=>setCurrency(e.target.value)}>
+        <option value='USD'>USD</option>
+      </select>
+      <button disabled={loading}>Create Card</button>
+      {error && <p style={{color:'red'}}>{error}</p>}
+    </form>
+  );
+}
+```
+
+Affichage Carte – Composant
+---------------------------
+```tsx
+export function CardView({ card }:{ card: { name_on_card:string; last4?:string; currency:string; balance:number; expiry?:string; card_status:string } }){
+  return (
+    <div className='virtual-card'>
+      <div className='card-row'>**** **** **** {card.last4 || '----'}</div>
+      <div className='card-name'>{card.name_on_card}</div>
+      <div className='card-meta'>Balance: {card.balance.toFixed(2)} {card.currency}</div>
+      <div className='card-exp'>Expiry: {card.expiry || '--/--'}</div>
+      <div className={`status status-${card.card_status}`}>{card.card_status}</div>
+    </div>
+  );
+}
+```
+
+Gestion Erreurs & Cas Spéciaux
+------------------------------
+- Solde insuffisant: Intercepter `error_code === 'CARD_CREATION_ERROR'`, proposer recharger compte.
+- Currency manquante (500 interne): Ajouter garde côté React avant appel.
+- Requêtes multiples simultanées: Désactiver bouton, utiliser `loading`.
+- Idempotence basique: empêcher double clic (state `submitting`).
+
+Sécurité
+--------
+1. Clé publique jamais exposée directement dans code front: uniquement Edge Functions.
+2. RLS empêche lecture cartes d'autres utilisateurs.
+3. Ne pas stocker PAN / CVV.
+4. Ajouter rate limiting (ex: compteur dans `strowallet_audit`).
+5. Logger webhooks pour réconciliation (card_status changements, transactions).
+
+Checklist Final
+---------------
+- [ ] Variables env définies (PUBLIC_KEY, BASE_URL, MODE).
+- [ ] Edge Functions déployées.
+- [ ] Tables + RLS créées.
+- [ ] Bucket storage protégé (private).
+- [ ] Formulaires React validant les champs.
+- [ ] Gestion erreurs centralisée.
+- [ ] Webhook endpoint protégé (clé secrète / signature quand disponible).
+
+Extensions Futures
+------------------
+- Ajout fonction fund card (si API disponible).
+- Synchronisation planifiée (cron) des balances.
+- Dashboard admin Supabase + métriques (nombre cartes actives, total charges).
+
+Résumé
+------
+Ce guide fournit une base complète pour migrer ou implémenter l'intégration Strowallet côté React + Supabase avec sécurité minimale, gestion KYC, création et consultation de cartes. Adapter selon évolutions API (ajout de `mastercard`, signature webhooks, etc.).
