@@ -499,18 +499,14 @@ class AddMoneyController extends Controller
 
         $validated['card_number']     = str_replace(' ', '', $validated['card_number']);
 
-        // Expect card expiry format MM/YY
         $convert_date   = explode('/', $validated['date']);
-        if(count($convert_date) !== 2 || !ctype_digit($convert_date[0]) || !ctype_digit($convert_date[1])) {
-            return back()->with(['error' => [__('Invalid expiry date format. Use MM/YY')]])->withInput();
-        }
-        $month          = $convert_date[0];
-        $year_two       = $convert_date[1];
+        $month          = $convert_date[1];
+        $year           = $convert_date[0];
 
         $current_year   = substr(date('Y'), 0, 2);
-        $full_year      = $current_year . $year_two;
+        $full_year      = $current_year . $year;
 
-        $validated['date'] = $full_year . '-' . str_pad($month,2,'0',STR_PAD_LEFT);
+        $validated['date'] = $full_year . '-' . $month;
 
         $merchantAuthentication = new AnetAPI\MerchantAuthenticationType();
         $merchantAuthentication->setName($gateway_credentials->app_login_id);

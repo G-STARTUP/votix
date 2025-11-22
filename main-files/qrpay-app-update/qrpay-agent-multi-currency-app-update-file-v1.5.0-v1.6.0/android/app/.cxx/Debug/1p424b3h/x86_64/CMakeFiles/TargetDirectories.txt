@@ -1,2 +1,0 @@
-/Users/touhid/cc-project/Qrpay-Multicurrency-Agent-App/android/app/.cxx/Debug/1p424b3h/x86_64/CMakeFiles/edit_cache.dir
-/Users/touhid/cc-project/Qrpay-Multicurrency-Agent-App/android/app/.cxx/Debug/1p424b3h/x86_64/CMakeFiles/rebuild_cache.dir

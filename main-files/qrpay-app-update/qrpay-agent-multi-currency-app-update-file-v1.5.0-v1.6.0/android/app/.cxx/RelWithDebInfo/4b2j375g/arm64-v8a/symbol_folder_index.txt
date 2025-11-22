@@ -1,1 +1,0 @@
-D:\All Qrpay\Qrpay-Multicurrency-Agent-App\build\app\intermediates\cxx\RelWithDebInfo\4b2j375g\obj\arm64-v8a
