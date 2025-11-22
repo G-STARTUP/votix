@@ -1,0 +1,98 @@
+name: qrpay
+description: A new Flutter project.
+publish_to: "none" # Remove this line if you wish to publish to pub.dev
+
+version: 1.3.0+3
+
+environment:
+  sdk: ">=3.8.1 <4.4.0"
+  flutter: 3.32.8
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: 1.0.8 
+  get: 4.7.2
+  flutter_screenutil: ^5.9.3
+  google_fonts: 6.3.1
+  country_code_picker: 3.4.0
+  get_storage: ^2.1.1
+  logger: 2.6.1
+  pin_code_fields: 8.0.1
+  intl: ^0.20.2
+  image_picker: 1.2.0
+  dotted_line: 3.2.3
+  flutter_svg: 2.2.1 
+  percent_indicator: 4.2.5
+  flip_card: ^0.7.0
+  dotted_border: 3.1.0
+  carousel_slider: ^5.1.1
+  connectivity_plus: 7.0.0
+  awesome_snackbar_content: 0.1.8 
+  smooth_page_indicator: 1.2.1
+  country_list_pick: ^1.0.1+6
+  intl_phone_field: 3.2.0
+  http: 1.5.0 
+  flutter_inappwebview: 6.1.5
+  patterns_canvas: ^0.5.0
+  flutter_html: 3.0.0
+  share_plus: 12.0.0
+  local_auth: 2.3.0
+  cached_network_image: 3.4.1
+  build_runner:
+  path_provider: ^2.1.5
+  uuid:
+  flutter_local_notifications:
+  iconsax: ^0.0.8
+  flutter_animate: 4.5.2
+  flutter_staggered_animations: ^1.1.1
+  qr_flutter: ^4.1.0
+  loading_animation_widget:
+  lottie: 3.3.2 
+  dropdown_button2: ^2.3.9
+  pusher_beams:
+  firebase_core:
+  win32:
+  restart_app: ^1.3.2
+  qr_code_scanner_plus: ^2.0.10
+  shimmer: ^3.0.0
+
+dependency_overrides:
+  awesome_snackbar_content:
+  flutter_svg:
+  uuid: ^4.5.1
+  intl: ^0.20.2
+  file:
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  change_app_package_name:
+  flutter_lints:
+  rename_app:
+
+flutter_icons:
+  android: "launcher_icon"
+  ios: true
+  image_path: "assets/logo/app_launcher.png"
+
+flutter_gen:
+  output: lib/custom_assets/ # Optional (default: lib/gen/)
+  line_length: 80 # Optional (default: 80)
+flutter:
+  uses-material-design: true
+  fonts:
+    - family: AgencyFB-Bold
+      fonts:
+        - asset: fonts/AgencyFB-Bold.ttf
+
+  assets:
+    - assets/animation/
+    - assets/card/
+    - assets/clipart/
+    - assets/icon/
+    - assets/icon/wallet.svg
+    - assets/logo/
+    - assets/onboard/
+    - assets/qr/

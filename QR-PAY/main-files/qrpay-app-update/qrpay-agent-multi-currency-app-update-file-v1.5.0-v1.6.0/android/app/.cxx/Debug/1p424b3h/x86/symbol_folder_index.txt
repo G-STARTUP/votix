@@ -1,0 +1,1 @@
+/Users/touhid/cc-project/Qrpay-Multicurrency-Agent-App/build/app/intermediates/cxx/Debug/1p424b3h/obj/x86

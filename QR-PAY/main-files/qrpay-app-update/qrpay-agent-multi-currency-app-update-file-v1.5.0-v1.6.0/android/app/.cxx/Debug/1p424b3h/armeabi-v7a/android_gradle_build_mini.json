@@ -1,0 +1,20 @@
+{
+  "buildFiles": [
+    "/Users/touhid/flutter/packages/flutter_tools/gradle/src/main/groovy/CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "/Users/touhid/Library/Android/sdk/cmake/3.22.1/bin/ninja",
+      "-C",
+      "/Users/touhid/cc-project/Qrpay-Multicurrency-Agent-App/android/app/.cxx/Debug/1p424b3h/armeabi-v7a",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "/Users/touhid/Library/Android/sdk/cmake/3.22.1/bin/ninja",
+    "-C",
+    "/Users/touhid/cc-project/Qrpay-Multicurrency-Agent-App/android/app/.cxx/Debug/1p424b3h/armeabi-v7a",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {}
+}
